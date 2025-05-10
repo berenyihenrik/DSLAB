@@ -1,6 +1,7 @@
 # DSLAB
 
-## [Overleaf](https://www.overleaf.com/read/xnfjbgqsgqnv#0ea0c7)
+## [Overleaf - Report](https://www.overleaf.com/read/hmjvccnwkjxb#1b8213)
+## [Overleaf - Literature Review](https://www.overleaf.com/read/xnfjbgqsgqnv#0ea0c7)
 
 ### Temporal and Spatial Anomaly Detection
 
