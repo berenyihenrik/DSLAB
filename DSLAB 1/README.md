@@ -1,28 +1,21 @@
-# Data Science Laboratory
+# DSLAB
 
-## DSLAB 1
+## [Overleaf - Report](https://www.overleaf.com/read/hmjvccnwkjxb#1b8213)
+## [Overleaf - Literature Review](https://www.overleaf.com/read/xnfjbgqsgqnv#0ea0c7)
 
-### [Overleaf - Report](https://www.overleaf.com/read/hmjvccnwkjxb#1b8213)
+### Temporal and Spatial Anomaly Detection
 
-### [Overleaf - Literature Review](https://www.overleaf.com/read/xnfjbgqsgqnv#0ea0c7)
-
-## DSLAB 2
-
-### [Overleaf - Semester Plan](https://www.overleaf.com/read/qfqqmwcdkndy#c3c0d2)
-
-## Temporal and Spatial Anomaly Detection
-
-### Definition
+#### Definition
 
 Develop a hybrid model for detecting anomalies in datasets with temporal and spatial components, such as traffic or climate data. The model will combine time-series analysis and spatial clustering to identify irregular patterns.  
 
-### Challenges
+#### Challenges
 
 * Integrating temporal and spatial features into a cohesive modeling framework.
 * Choosing effective methods for temporal and spatial anomaly detection.
 * Handling the interplay of noise across temporal and spatial dimensions.
 
-### Objectives
+#### Objectives
 
 1. Implement a hybrid anomaly detection model that combines temporal (e.g., time series analysis) and spatial clustering methods.
 2. Test the model on spatio-temporal datasets (e.g., traffic patterns, weather anomalies).
