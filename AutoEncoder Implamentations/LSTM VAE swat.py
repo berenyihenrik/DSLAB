@@ -22,100 +22,110 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import f1_score, classification_report, confusion_matrix
 
 
-# ## Download the dataset
-
-# In[ ]:
-
-
-get_ipython().system('wget https://raw.githubusercontent.com/khundman/telemanom/master/labeled_anomalies.csv')
-
-
-# In[ ]:
-
-
-get_ipython().run_line_magic('env', 'DRIVE_PATH=/content/drive/MyDrive/Colab Notebooks/ELTE/DSLAB/')
-
-
-# In[ ]:
-
-
-get_ipython().system('mkdir "/root/.config/kaggle"')
-
-
-# In[ ]:
-
-
-get_ipython().system('cp "$DRIVE_PATH/kaggle.json" "/root/.config/kaggle"')
-get_ipython().system('chmod 600 "/root/.config/kaggle/kaggle.json"')
-
-
-# In[ ]:
-
-
-get_ipython().system('cd "$DRIVE_PATH" && kaggle datasets download -d patrickfleith/nasa-anomaly-detection-dataset-smap-msl && mv nasa-anomaly-detection-dataset-smap-msl.zip data.zip && unzip -o data.zip && rm data.zip && mv data/data tmp && rm -r data && mv tmp data')
-
-
 # ## Setup the dataset
 
 # In[2]:
 
 
-DRIVE = "drive/MyDrive/Colab Notebooks/ELTE/DSLAB/ServerMachineDataset/"
-MACHINE = "machine-1-1.txt"
-TRAIN_DATASET = DRIVE + "train/" + MACHINE
-TEST_DATASET = DRIVE + "test/" + MACHINE
-TEST_LABEL_DATASET = DRIVE + "test_label/" + MACHINE
+DRIVE = "drive/MyDrive/Colab Notebooks/ELTE/DSLAB/swat/"
+DRIVE = "swat/"
+TRAIN_FILE_NAME = "SWaT_Dataset_Normal_v0 1.csv"
+TRAIN_DATASET = DRIVE + TRAIN_FILE_NAME
+TEST_FILE_NAME = "SWaT_Dataset_Attack_v0 1.csv"
+TEST_DATASET = DRIVE + TEST_FILE_NAME
 
-metric = pd.read_csv(TRAIN_DATASET, header=None)
-metric_test = pd.read_csv(TEST_DATASET, header=None)
-true_anomalies = pd.read_csv(TEST_LABEL_DATASET, header=None)[0].to_numpy()
+data_train = pd.read_csv(TRAIN_DATASET, header=None)
+data_test = pd.read_csv(TEST_DATASET, header=None)
 
 
 # In[3]:
 
 
-metric
+data_train.replace("Normal", 0, inplace=True)
+data_test.replace("Normal", 0, inplace=True)
+data_test.replace("Attack", 1, inplace=True)
+data_test.replace("A ttack", 1, inplace=True)
+
+train = data_train.iloc[:, 1:].copy()
+train = train.iloc[:, :-1].copy()
+test = data_test.iloc[:, 1:].copy()
+test = test.iloc[:, :-1].copy()
+
+
+# In[4]:
+
+
+true_anomalies = data_test[52].to_numpy()
+true_anomalies = np.delete(true_anomalies, 0)
+true_anomalies = true_anomalies.astype(int)
+
+
+# In[5]:
+
+
+true_anomalies
+
+
+# In[6]:
+
+
+train
+
+
+# In[7]:
+
+
+test
 
 
 # # Preprocess the Dataset
 
-# In[3]:
+# In[8]:
 
 
-# Scale the values of the input metrics
-scaler = MinMaxScaler()
-metric_scaled = scaler.fit_transform(metric)
-metric_tensor = torch.tensor(metric_scaled, dtype=torch.float32)
-metric_scaled = pd.DataFrame(metric_scaled, index=metric.index, columns=metric.columns)
-metric_scaled
+# remove headers
+if train.iloc[0].dtype == 'object':
+    train = train[1:].copy()
+    test = test[1:].copy()
 
+# convert all columns to numeric
+train = train.apply(pd.to_numeric, errors='coerce')
+test = test.apply(pd.to_numeric, errors='coerce')
 
-# ### Scaled
+# interpolate/fill NaNs after conversion if necessary
+train.interpolate(inplace=True)
+train.bfill(inplace=True)
+test.interpolate(inplace=True)
+test.bfill(inplace=True)
 
-# In[17]:
+# calculate variance, crop columns with variance close to zero.
+variance_threshold = 1e-6
+variances = train.var()
+low_variance_cols = variances[variances < variance_threshold].index
 
+print(f"Columns with very low variance: {list(low_variance_cols)}")
 
-# create train and test dataloaders
-metric.interpolate(inplace=True)
-metric.bfill(inplace=True)
-metric_tensor = metric.values
+# drop low variance columns
+train_filtered = train.drop(columns=low_variance_cols)
+test_filtered = test.drop(columns=low_variance_cols)
 
-metric_test.interpolate(inplace=True)
-metric_test.bfill(inplace=True)
-metric_test_tensor = metric_test.values
+print(f"Original number of features: {train.shape[1]}")
+print(f"Number of features after removing low variance columns: {train_filtered.shape[1]}")
+
+# egenerate the tensors and dataloaders with the filtered data
+train_tensor = train_filtered.values
+test_tensor = test_filtered.values
 
 sequence_length = 30
 sequences = []
-for i in range(metric_tensor.shape[0] - sequence_length + 1):
-  sequences.append(metric_tensor[i:i + sequence_length])
+for i in range(train_tensor.shape[0] - sequence_length + 1):
+  sequences.append(train_tensor[i:i + sequence_length])
 
-
-train_data, val_data = train_test_split(sequences, test_size=0.3, random_state=42) # 70% train, 30% temp
+train_data, val_data = train_test_split(sequences, test_size=0.3, random_state=42, shuffle=False) # 70% train, 30% temp
 
 test_sequences = []
-for i in range(metric_test_tensor.shape[0] - sequence_length + 1):
-  test_sequences.append(metric_test_tensor[i:i + sequence_length])
-
+for i in range(test_tensor.shape[0] - sequence_length + 1):
+  test_sequences.append(test_tensor[i:i + sequence_length])
 
 batch_size = 32
 train_loader = DataLoader(dataset=train_data, batch_size=batch_size, shuffle=True)
@@ -124,7 +134,7 @@ test_loader = DataLoader(dataset=test_sequences, batch_size=batch_size, shuffle=
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# In[18]:
+# In[9]:
 
 
 sequences[0].shape
@@ -134,7 +144,7 @@ sequences[0].shape
 
 # ## LSTM
 
-# In[19]:
+# In[10]:
 
 
 class LSTMEncoder(nn.Module):
@@ -183,10 +193,10 @@ class LSTMVAE(nn.Module):
         return x_recon, mean, logvar
 
 
-# In[20]:
+# In[11]:
 
 
-input_dim = 38
+input_dim = train_filtered.shape[1]
 hidden_dim = 128
 latent_dim = 32
 num_layers = 1
@@ -202,7 +212,7 @@ optimizer = Adam(model.parameters(), lr=1e-3)
 
 # ## Support functions
 
-# In[21]:
+# In[12]:
 
 
 def loss_function(x, x_hat, mean, log_var):
@@ -222,14 +232,14 @@ def save_model(model):
         'hidden_dim':hidden_dim,
         'state_dict':model.state_dict()
     }
-    torch.save(model_state,'vae.pth')
+    torch.save(model_state,'vae_swat.pth')
 
 
 # # Train
 
 # ## LSTM
 
-# In[23]:
+# In[14]:
 
 
 torch.cuda.empty_cache()
@@ -305,7 +315,7 @@ train_losses, val_losses = train_model(model, train_loader, val_loader, optimize
 
 # # Evaluate
 
-# In[24]:
+# In[15]:
 
 
 def evaluate_lstm(model, test_loader, device, percentile_threshold=90):
@@ -334,7 +344,7 @@ def evaluate_lstm(model, test_loader, device, percentile_threshold=90):
 anomalies = evaluate_lstm(model, test_loader, device, 90)
 
 
-# In[25]:
+# In[16]:
 
 
 def calculate_f1_score(anomaly_indices, true_anomalies):
@@ -353,13 +363,13 @@ f1, predicted_anomalies = calculate_f1_score(anomalies, true_anomalies)
 print(f"F1 Score: {f1}")
 
 
-# In[26]:
+# In[17]:
 
 
 print(classification_report(true_anomalies, predicted_anomalies))
 
 
-# In[27]:
+# In[18]:
 
 
 print(confusion_matrix(true_anomalies, predicted_anomalies))
