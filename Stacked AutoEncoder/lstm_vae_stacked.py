@@ -115,37 +115,50 @@ num_selected_features = 25 # You can adjust this number
 
 # Get the indices of the top N features
 selected_feature_indices = ranked_features_indices[:num_selected_features]
+remaining_feature_indices = ranked_features_indices[num_selected_features:]
 print(f"\nSelected Top {num_selected_features} Feature Indices: {selected_feature_indices}")
-
-print(sequences[0].shape)
+print(f"\nRemaining {len(remaining_feature_indices)} Feature Indices: {remaining_feature_indices}")
 
 # Select only the top features for the datasets
 metric_tensor_selected = metric_tensor[:, selected_feature_indices]
 metric_test_tensor_selected = metric_test_tensor[:, selected_feature_indices]
 
-# Create sequences and dataloaders with selected features
+# Create datasets with top features and remaining features
+metric_tensor_top = metric_tensor[:, selected_feature_indices]
+metric_tensor_remaining = metric_tensor[:, remaining_feature_indices]
+
+metric_test_tensor_top = metric_test_tensor[:, selected_feature_indices]
+metric_test_tensor_remaining = metric_test_tensor[:, remaining_feature_indices]
+
+# Create sequences for both feature groups
 sequence_length = 30
-sequences_selected = []
-for i in range(metric_tensor_selected.shape[0] - sequence_length + 1):
-  sequences_selected.append(metric_tensor_selected[i:i + sequence_length])
+sequences_top = []
+sequences_remaining = []
+for i in range(metric_tensor.shape[0] - sequence_length + 1):
+    sequences_top.append(metric_tensor_top[i:i + sequence_length])
+    sequences_remaining.append(metric_tensor_remaining[i:i + sequence_length])
 
-train_data_selected, val_data_selected = train_test_split(sequences_selected, test_size=0.3, random_state=42)
+# Combine into tuples for dataloaders
+sequences_combined = list(zip(sequences_top, sequences_remaining))
+train_data_combined, val_data_combined = train_test_split(sequences_combined, test_size=0.3, random_state=42)
 
-test_sequences_selected = []
-for i in range(metric_test_tensor_selected.shape[0] - sequence_length + 1):
-  test_sequences_selected.append(metric_test_tensor_selected[i:i + sequence_length])
+test_sequences_top = []
+test_sequences_remaining = []
+for i in range(metric_test_tensor.shape[0] - sequence_length + 1):
+    test_sequences_top.append(metric_test_tensor_top[i:i + sequence_length])
+    test_sequences_remaining.append(metric_test_tensor_remaining[i:i + sequence_length])
+
+test_sequences_combined = list(zip(test_sequences_top, test_sequences_remaining))
 
 batch_size = 32
-train_loader_selected = DataLoader(dataset=train_data_selected, batch_size=batch_size, shuffle=True)
-val_loader_selected = DataLoader(dataset=val_data_selected, batch_size=batch_size, shuffle=False)
-test_loader_selected = DataLoader(dataset=test_sequences_selected, batch_size=batch_size, shuffle=False)
+train_loader_combined = DataLoader(dataset=train_data_combined, batch_size=batch_size, shuffle=True)
+val_loader_combined = DataLoader(dataset=val_data_combined, batch_size=batch_size, shuffle=False)
+test_loader_combined = DataLoader(dataset=test_sequences_combined, batch_size=batch_size, shuffle=False)
 
-# Update input dimension for the model with the number of selected features
-input_dim_selected = len(selected_feature_indices)
-print(f"New input dimension for the model: {input_dim_selected}")
+print(f"Top features dimension: {len(selected_feature_indices)}")
+print(f"Remaining features dimension: {len(remaining_feature_indices)}")
 
-
-"""## Stacked"""
+"""## Stacked with Weighted Encoders"""
 
 class LSTMEncoder(nn.Module):
     def __init__(self, input_dim, hidden_dim, latent_dim, num_layers=1):
@@ -155,118 +168,149 @@ class LSTMEncoder(nn.Module):
         self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
 
     def forward(self, x):
-        # x can be (batch, seq, input_dim) for single sensor or batched sensors
-        _, (h_n, _) = self.lstm(x)  # h_n: (num_layers, batch, hidden_dim)
-        h = h_n[-1]  # take the output of the last layer
+        _, (h_n, _) = self.lstm(x)
+        h = h_n[-1]
         return self.fc_mean(h), self.fc_logvar(h)
 
 
 class SharedDecoder(nn.Module):
-    def __init__(self, input_features_dim, hidden_dim, output_features_dim, sequence_length, num_layers=1):
+    def __init__(self, input_features_dim, hidden_dim, output_features_dim_top, output_features_dim_remaining, sequence_length, num_layers=1):
         super(SharedDecoder, self).__init__()
         self.sequence_length = sequence_length
-        # The input to the decoder's linear layer is the concatenated latent vector
         self.latent_to_hidden = nn.Linear(input_features_dim, hidden_dim)
         self.lstm = nn.LSTM(hidden_dim, hidden_dim, num_layers=num_layers, batch_first=True)
-        # The output of the decoder's linear layer should be the reconstructed features for all sensors
-        self.output_layer = nn.Linear(hidden_dim, output_features_dim)
-
+        
+        # Separate output layers for top and remaining features
+        self.output_layer_top = nn.Linear(hidden_dim, output_features_dim_top)
+        self.output_layer_remaining = nn.Linear(hidden_dim, output_features_dim_remaining)
 
     def forward(self, z):
-        # Repeat z for each timestep
         hidden = self.latent_to_hidden(z).unsqueeze(1).repeat(1, self.sequence_length, 1)
         out, _ = self.lstm(hidden)
-        return self.output_layer(out)
+        recon_top = self.output_layer_top(out)
+        recon_remaining = self.output_layer_remaining(out)
+        return recon_top, recon_remaining
 
 
-class LSTMVAE_Stacked(nn.Module):
-    def __init__(self, input_dim, hidden_dim, latent_dim, sequence_length, num_layers=1, device='cpu', num_sensors=38):
-        super(LSTMVAE_Stacked, self).__init__()
+class LSTMVAE_Stacked_Weighted(nn.Module):
+    def __init__(self, input_dim, hidden_dim, latent_dim, sequence_length, num_layers=1, 
+                 device='cpu', num_top_sensors=25, num_remaining_sensors=13, 
+                 top_weight=0.7, remaining_weight=0.3):
+        super(LSTMVAE_Stacked_Weighted, self).__init__()
         self.input_dim = input_dim
-        self.num_sensors = num_sensors
+        self.num_top_sensors = num_top_sensors
+        self.num_remaining_sensors = num_remaining_sensors
         self.sequence_length = sequence_length
         self.device = device
+        self.top_weight = top_weight
+        self.remaining_weight = remaining_weight
         
-        # Keep separate encoders for interpretability
-        self.encoders = nn.ModuleList([
-            LSTMEncoder(input_dim, hidden_dim, latent_dim, num_layers).to(device) for _ in range(num_sensors)
+        # Separate encoders for top features
+        self.encoders_top = nn.ModuleList([
+            LSTMEncoder(input_dim, hidden_dim, latent_dim, num_layers).to(device) 
+            for _ in range(num_top_sensors)
         ])
         
-        decoder_input_features = num_sensors * latent_dim
-        decoder_output_features = input_dim * num_sensors
-        self.decoder = SharedDecoder(decoder_input_features, hidden_dim, decoder_output_features, sequence_length, num_layers).to(device)
+        # Single encoder for remaining features (processes all at once)
+        self.encoder_remaining = LSTMEncoder(num_remaining_sensors * input_dim, hidden_dim, latent_dim, num_layers).to(device)
+        
+        # Decoder input is concatenation of all latent representations
+        decoder_input_features = (num_top_sensors + 1) * latent_dim
+        decoder_output_features_top = input_dim * num_top_sensors
+        decoder_output_features_remaining = input_dim * num_remaining_sensors
+        
+        self.decoder = SharedDecoder(
+            decoder_input_features, 
+            hidden_dim, 
+            decoder_output_features_top,
+            decoder_output_features_remaining,
+            sequence_length, 
+            num_layers
+        ).to(device)
 
     def reparameterize(self, mean, logvar):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mean + eps * std
 
-    def forward(self, x):
-        # x shape: (batch_size, sequence_length, num_sensors * input_dim)
-        batch_size = x.shape[0]
+    def forward(self, x_top, x_remaining):
+        # x_top shape: (batch_size, sequence_length, num_top_sensors)
+        # x_remaining shape: (batch_size, sequence_length, num_remaining_sensors)
+        batch_size = x_top.shape[0]
         
-        # Reshape and permute to get (batch_size, num_sensors, seq_len, input_dim)
-        x_reshaped = x.view(batch_size, self.sequence_length, self.num_sensors, self.input_dim)
-        x_reshaped = x_reshaped.permute(0, 2, 1, 3)
+        # Process top features with individual encoders
+        x_top_reshaped = x_top.view(batch_size, self.sequence_length, self.num_top_sensors, self.input_dim)
+        x_top_reshaped = x_top_reshaped.permute(0, 2, 1, 3)
+        x_top_flat = x_top_reshaped.reshape(batch_size * self.num_top_sensors, self.sequence_length, self.input_dim)
         
-        # Stack all sensor data: (batch_size * num_sensors, seq_len, input_dim)
-        x_flat = x_reshaped.reshape(batch_size * self.num_sensors, self.sequence_length, self.input_dim)
-        
-        # Process all encoders - PyTorch will optimize this internally
-        means = []
-        logvars = []
-        for i, encoder in enumerate(self.encoders):
-            # Extract batch for this encoder
-            x_sensor = x_flat[i::self.num_sensors]  # Every num_sensors-th element starting from i
+        means_top = []
+        logvars_top = []
+        for i, encoder in enumerate(self.encoders_top):
+            x_sensor = x_top_flat[i::self.num_top_sensors]
             mean, logvar = encoder(x_sensor)
-            means.append(mean)
-            logvars.append(logvar)
+            means_top.append(mean)
+            logvars_top.append(logvar)
         
-        # Stack results
-        mean_stacked = torch.stack(means, dim=1)  # (batch_size, num_sensors, latent_dim)
-        logvar_stacked = torch.stack(logvars, dim=1)
+        mean_top_stacked = torch.stack(means_top, dim=1)
+        logvar_top_stacked = torch.stack(logvars_top, dim=1)
+        z_top_stacked = self.reparameterize(mean_top_stacked, logvar_top_stacked)
         
-        # Vectorized reparameterization
-        z_stacked = self.reparameterize(mean_stacked, logvar_stacked)
+        # Process remaining features with single encoder
+        x_remaining_flat = x_remaining.view(batch_size, self.sequence_length, -1)
+        mean_remaining, logvar_remaining = self.encoder_remaining(x_remaining_flat)
+        z_remaining = self.reparameterize(mean_remaining, logvar_remaining)
         
-        # Flatten for decoder
-        mean_combined = mean_stacked.reshape(batch_size, -1)
-        logvar_combined = logvar_stacked.reshape(batch_size, -1)
-        z_combined = z_stacked.reshape(batch_size, -1)
+        # Combine latent representations
+        z_top_combined = z_top_stacked.reshape(batch_size, -1)
+        z_combined = torch.cat([z_top_combined, z_remaining], dim=1)
+        
+        mean_combined = torch.cat([mean_top_stacked.reshape(batch_size, -1), mean_remaining], dim=1)
+        logvar_combined = torch.cat([logvar_top_stacked.reshape(batch_size, -1), logvar_remaining], dim=1)
+        
+        # Decode
+        x_recon_top, x_recon_remaining = self.decoder(z_combined)
+        
+        return x_recon_top, x_recon_remaining, mean_combined, logvar_combined
 
-        x_recon = self.decoder(z_combined)
-
-        return x_recon, mean_combined, logvar_combined
-
-num_sensors = len(selected_feature_indices)
+num_top_sensors = len(selected_feature_indices)
+num_remaining_sensors = len(remaining_feature_indices)
 input_dim = 1
 hidden_dim = 128
 latent_dim = 32
 num_layers = 1
 
-model = LSTMVAE_Stacked(num_sensors=num_sensors,
-                input_dim=input_dim,
-                hidden_dim=hidden_dim,
-                latent_dim=latent_dim,
-                sequence_length=sequence_length,
-                num_layers=num_layers,
-                device=device).to(device)
+model = LSTMVAE_Stacked_Weighted(
+    num_top_sensors=num_top_sensors,
+    num_remaining_sensors=num_remaining_sensors,
+    input_dim=input_dim,
+    hidden_dim=hidden_dim,
+    latent_dim=latent_dim,
+    sequence_length=sequence_length,
+    num_layers=num_layers,
+    device=device,
+    top_weight=0.7,
+    remaining_weight=0.3
+).to(device)
+
 optimizer = Adam(model.parameters(), lr=1e-3)
 
-batch = [torch.randn(batch_size, sequence_length, 1) for _ in range(num_sensors)]
-
-# Concatenate the list of tensors into a single tensor
-batch_tensor = torch.cat(batch, dim=2).to(device) # Concatenate along the last dimension (features)
-
-output, _, _ = model(batch_tensor)  # [batch_size, seq_len, num_sensors * input_dim]
-print(output.shape)
+# Test forward pass
+batch_top = torch.randn(batch_size, sequence_length, num_top_sensors).to(device)
+batch_remaining = torch.randn(batch_size, sequence_length, num_remaining_sensors).to(device)
+output_top, output_remaining, _, _ = model(batch_top, batch_remaining)
+print(f"Output top shape: {output_top.shape}, Output remaining shape: {output_remaining.shape}")
 
 """## Support functions"""
 
-def loss_function(x, x_hat, mean, log_var):
-    reproduction_loss = nn.functional.mse_loss(x_hat, x, reduction='sum')
-    KLD = - 0.5 * torch.sum(1+ log_var - mean.pow(2) - log_var.exp())
-
+def loss_function_weighted(x_top, x_remaining, x_hat_top, x_hat_remaining, mean, log_var, top_weight=0.7, remaining_weight=0.3):
+    reproduction_loss_top = nn.functional.mse_loss(x_hat_top, x_top, reduction='sum')
+    reproduction_loss_remaining = nn.functional.mse_loss(x_hat_remaining, x_remaining, reduction='sum')
+    
+    # Weighted reconstruction loss
+    reproduction_loss = top_weight * reproduction_loss_top + remaining_weight * reproduction_loss_remaining
+    
+    KLD = -0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
+    
     return reproduction_loss + KLD
 
 def save_model(model, name):
@@ -280,7 +324,7 @@ def save_model(model, name):
 
 """# Train
 
-## LSTM
+## LSTM with Weighted Encoders
 """
 
 torch.cuda.empty_cache()
@@ -292,7 +336,7 @@ scheduler = ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.1)
 # bayesian hyperparameter tuning
 # grid search - slow for DL
 
-def train_model(model, train_loader, val_loader, optimizer, loss_fn, scheduler, num_epochs=10, device='cpu'):
+def train_model_weighted(model, train_loader, val_loader, optimizer, loss_fn, scheduler, num_epochs=10, device='cpu'):
     torch.cuda.empty_cache()
     train_losses = []
     val_losses = []
@@ -306,34 +350,29 @@ def train_model(model, train_loader, val_loader, optimizer, loss_fn, scheduler, 
         epoch_start_time = time.time()
         train_loss = 0.0
         model.train()
-        
+
         # Profiling timers
         forward_time = 0.0
         backward_time = 0.0
         
-        for batch in train_loader:
-            batch = torch.tensor(batch, dtype=torch.float32).to(device)
+        for batch_top, batch_remaining in train_loader:
+            batch_top = torch.tensor(batch_top, dtype=torch.float32).to(device)
+            batch_remaining = torch.tensor(batch_remaining, dtype=torch.float32).to(device)
+            
             optimizer.zero_grad()
 
             # Time forward pass
             t0 = time.time()
-            # with autocast():
-            recon_batch, mean, logvar = model(batch)
-            loss = loss_fn(recon_batch, batch, mean, logvar)
-            if device.type == 'cuda':
-                torch.cuda.synchronize()
+            
+            recon_top, recon_remaining, mean, logvar = model(batch_top, batch_remaining)
+            loss = loss_fn(batch_top, batch_remaining, recon_top, recon_remaining, mean, logvar, 
+                          model.top_weight, model.remaining_weight)
+            
             forward_time += time.time() - t0
-
-            # Time backward pass
-            t0 = time.time()
-            # scaler.scale(loss).backward()
-            # scaler.step(optimizer)
-            # scaler.update()
+            
             loss.backward()
             optimizer.step()
 
-            if device.type == 'cuda':
-                torch.cuda.synchronize()
             backward_time += time.time() - t0
             
             train_loss += loss.item()
@@ -345,10 +384,13 @@ def train_model(model, train_loader, val_loader, optimizer, loss_fn, scheduler, 
         model.eval()
         valid_loss = 0.0
         with torch.no_grad():
-            for batch in val_loader:
-                batch = torch.tensor(batch, dtype=torch.float32).to(device)
-                recon_batch, mean, logvar = model(batch)
-                loss = loss_fn(recon_batch, batch, mean, logvar)
+            for batch_top, batch_remaining in val_loader:
+                batch_top = torch.tensor(batch_top, dtype=torch.float32).to(device)
+                batch_remaining = torch.tensor(batch_remaining, dtype=torch.float32).to(device)
+                
+                recon_top, recon_remaining, mean, logvar = model(batch_top, batch_remaining)
+                loss = loss_fn(batch_top, batch_remaining, recon_top, recon_remaining, mean, logvar,
+                              model.top_weight, model.remaining_weight)
                 valid_loss += loss.item()
 
         valid_loss /= len(val_loader)
@@ -376,36 +418,40 @@ def train_model(model, train_loader, val_loader, optimizer, loss_fn, scheduler, 
     print("Finished Training.")
     return train_losses, val_losses
 
-train_losses, val_losses = train_model(model, train_loader_selected, val_loader_selected, optimizer, loss_function, scheduler, num_epochs=3, device=device)
+scheduler = ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.1)
+train_losses, val_losses = train_model_weighted(model, train_loader_combined, val_loader_combined, 
+                                                 optimizer, loss_function_weighted, scheduler, 
+                                                 num_epochs=50, device=device)
 
-save_model(model, 'vae_stacked')
+save_model(model, 'vae_stacked_weighted')
 
 """# Evaluate"""
 
-def evaluate_lstm(model, test_loader, device, percentile_threshold=90):
+def evaluate_lstm_weighted(model, test_loader, device, percentile_threshold=90):
     model.eval()
     anomaly_scores = []
 
     with torch.no_grad():
-        for batch in test_loader:
-            batch = torch.tensor(batch, dtype=torch.float32).to(device)
+        for batch_top, batch_remaining in test_loader:
+            batch_top = torch.tensor(batch_top, dtype=torch.float32).to(device)
+            batch_remaining = torch.tensor(batch_remaining, dtype=torch.float32).to(device)
 
             batch_scores = []
-            for i in range(batch.shape[0]): #Iterate through each sequence in the batch
-                sequence = batch[i, :, :].unsqueeze(0)  # Select a single sequence
-                recon_batch, mean, logvar = model(sequence)
-                loss = loss_function(recon_batch, sequence, mean, logvar)
+            for i in range(batch_top.shape[0]):
+                sequence_top = batch_top[i, :, :].unsqueeze(0)
+                sequence_remaining = batch_remaining[i, :, :].unsqueeze(0)
+                
+                recon_top, recon_remaining, mean, logvar = model(sequence_top, sequence_remaining)
+                loss = loss_function_weighted(sequence_top, sequence_remaining, recon_top, recon_remaining, 
+                                             mean, logvar, model.top_weight, model.remaining_weight)
                 batch_scores.append(loss.item())
-            anomaly_scores.extend(batch_scores)  # Append scores for all sequences in the batch
+            anomaly_scores.extend(batch_scores)
 
-
-    # Calculate the threshold based on the specified percentile
     threshold = np.percentile(anomaly_scores, percentile_threshold)
-
-    # Identify anomaly indices
     anomaly_indices = [i for i, score in enumerate(anomaly_scores) if score > threshold]
     return anomaly_indices
-anomalies = evaluate_lstm(model, test_loader_selected, device, 90)
+
+anomalies = evaluate_lstm_weighted(model, test_loader_combined, device, 90)
 
 def calculate_f1_score(anomaly_indices, true_anomalies):
     # Create a binary array representing predicted anomalies
@@ -418,14 +464,11 @@ def calculate_f1_score(anomaly_indices, true_anomalies):
     f1 = f1_score(true_anomalies, predicted_anomalies)
     return f1, predicted_anomalies
 
-# Example usage (assuming 'anomalies' and 'true_anomalies' are defined)
 f1, predicted_anomalies = calculate_f1_score(anomalies, true_anomalies)
 print(f"F1 Score: {f1}")
 
-# Calculate AUC-ROC score
 auc_roc = roc_auc_score(true_anomalies, predicted_anomalies)
 print(f"AUC-ROC Score: {auc_roc}")
 
 print(classification_report(true_anomalies, predicted_anomalies))
-
 print(confusion_matrix(true_anomalies, predicted_anomalies))
