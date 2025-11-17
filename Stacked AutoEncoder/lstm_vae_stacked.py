@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 import pickle
 import copy
+import time
 from tqdm import trange,tqdm
 import torch.nn as nn
 from torch.optim import Adam
@@ -23,6 +24,7 @@ from torch.utils.data import DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import f1_score, classification_report, confusion_matrix, roc_auc_score
+from torch.cuda.amp import autocast, GradScaler
 
 """## Setup the dataset"""
 
@@ -63,7 +65,7 @@ for i in range(metric_test_tensor.shape[0] - sequence_length + 1):
   test_sequences.append(metric_test_tensor[i:i + sequence_length])
 
 
-batch_size = 32
+batch_size = 128
 train_loader = DataLoader(dataset=train_data, batch_size=batch_size, shuffle=True)
 val_loader = DataLoader(dataset=val_data, batch_size=batch_size, shuffle=False)
 test_loader = DataLoader(dataset=test_sequences, batch_size=batch_size, shuffle=False)
@@ -82,6 +84,7 @@ class LSTMEncoder(nn.Module):
         self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
 
     def forward(self, x):
+        # x can be (batch, seq, input_dim) for single sensor or batched sensors
         _, (h_n, _) = self.lstm(x)  # h_n: (num_layers, batch, hidden_dim)
         h = h_n[-1]  # take the output of the last layer
         return self.fc_mean(h), self.fc_logvar(h)
@@ -110,12 +113,15 @@ class LSTMVAE_Stacked(nn.Module):
         super(LSTMVAE_Stacked, self).__init__()
         self.input_dim = input_dim
         self.num_sensors = num_sensors
+        self.sequence_length = sequence_length
+        self.device = device
+        
+        # Keep separate encoders for interpretability
         self.encoders = nn.ModuleList([
             LSTMEncoder(input_dim, hidden_dim, latent_dim, num_layers).to(device) for _ in range(num_sensors)
         ])
-        # The decoder's input feature dimension is the sum of latent dimensions from all encoders
+        
         decoder_input_features = num_sensors * latent_dim
-        # The decoder's output feature dimension is the sum of input dimensions for all sensors
         decoder_output_features = input_dim * num_sensors
         self.decoder = SharedDecoder(decoder_input_features, hidden_dim, decoder_output_features, sequence_length, num_layers).to(device)
 
@@ -126,30 +132,37 @@ class LSTMVAE_Stacked(nn.Module):
 
     def forward(self, x):
         # x shape: (batch_size, sequence_length, num_sensors * input_dim)
+        batch_size = x.shape[0]
+        
+        # Reshape and permute to get (batch_size, num_sensors, seq_len, input_dim)
+        x_reshaped = x.view(batch_size, self.sequence_length, self.num_sensors, self.input_dim)
+        x_reshaped = x_reshaped.permute(0, 2, 1, 3)
+        
+        # Stack all sensor data: (batch_size * num_sensors, seq_len, input_dim)
+        x_flat = x_reshaped.reshape(batch_size * self.num_sensors, self.sequence_length, self.input_dim)
+        
+        # Process all encoders - PyTorch will optimize this internally
         means = []
         logvars = []
-        zs = []
-
-        # Process each sensor's data with its corresponding encoder
-        for i in range(self.num_sensors):
-            # Select data for the i-th sensor across all timesteps in the sequence
-            # Assuming input_dim is 1 as defined in the original code
-            x_sensor = x[:, :, i*self.input_dim:(i+1)*self.input_dim] # Shape: (batch_size, sequence_length, input_dim)
-
-            mean, logvar = self.encoders[i](x_sensor)
-            z = self.reparameterize(mean, logvar)
-
+        for i, encoder in enumerate(self.encoders):
+            # Extract batch for this encoder
+            x_sensor = x_flat[i::self.num_sensors]  # Every num_sensors-th element starting from i
+            mean, logvar = encoder(x_sensor)
             means.append(mean)
             logvars.append(logvar)
-            zs.append(z)
+        
+        # Stack results
+        mean_stacked = torch.stack(means, dim=1)  # (batch_size, num_sensors, latent_dim)
+        logvar_stacked = torch.stack(logvars, dim=1)
+        
+        # Vectorized reparameterization
+        z_stacked = self.reparameterize(mean_stacked, logvar_stacked)
+        
+        # Flatten for decoder
+        mean_combined = mean_stacked.reshape(batch_size, -1)
+        logvar_combined = logvar_stacked.reshape(batch_size, -1)
+        z_combined = z_stacked.reshape(batch_size, -1)
 
-        # Concatenate the latent representations from all encoders
-        z_combined = torch.cat(zs, dim=1) # Shape: (batch_size, num_sensors * latent_dim)
-
-        mean_combined = torch.cat(means, dim=1)
-        logvar_combined = torch.cat(logvars, dim=1)
-
-        # Decode the combined latent representation
         x_recon = self.decoder(z_combined)
 
         return x_recon, mean_combined, logvar_combined
@@ -201,6 +214,7 @@ def save_model(model, name):
 
 torch.cuda.empty_cache()
 
+scaler = GradScaler()
 scheduler = ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.1)
 
 # SPO optimizer - optuna
@@ -218,18 +232,39 @@ def train_model(model, train_loader, val_loader, optimizer, loss_fn, scheduler, 
     best_model_wts = copy.deepcopy(model.state_dict())
 
     for epoch in range(num_epochs):
+        epoch_start_time = time.time()
         train_loss = 0.0
         model.train()
+        
+        # Profiling timers
+        forward_time = 0.0
+        backward_time = 0.0
+        
         for batch in train_loader:
             batch = torch.tensor(batch, dtype=torch.float32).to(device)
-
             optimizer.zero_grad()
 
+            # Time forward pass
+            t0 = time.time()
+            # with autocast():
             recon_batch, mean, logvar = model(batch)
             loss = loss_fn(recon_batch, batch, mean, logvar)
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            forward_time += time.time() - t0
 
+            # Time backward pass
+            t0 = time.time()
+            # scaler.scale(loss).backward()
+            # scaler.step(optimizer)
+            # scaler.update()
             loss.backward()
             optimizer.step()
+
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            backward_time += time.time() - t0
+            
             train_loss += loss.item()
 
         train_loss /= len(train_loader)
@@ -250,6 +285,8 @@ def train_model(model, train_loader, val_loader, optimizer, loss_fn, scheduler, 
 
         scheduler.step(valid_loss)
 
+        epoch_time = time.time() - epoch_start_time
+
         if valid_loss < best_loss:
             best_loss = valid_loss
             best_model_wts = copy.deepcopy(model.state_dict())
@@ -257,7 +294,8 @@ def train_model(model, train_loader, val_loader, optimizer, loss_fn, scheduler, 
         else:
             early_stop_tolerant_count += 1
 
-        print(f"Epoch {epoch+1:04d}: train loss {train_loss:.4f}, valid loss {valid_loss:.4f}")
+        print(f"Epoch {epoch+1:04d}: train loss {train_loss:.4f}, valid loss {valid_loss:.4f}, "
+              f"time {epoch_time:.2f}s (forward: {forward_time:.2f}s, backward: {backward_time:.2f}s)")
 
         if early_stop_tolerant_count >= early_stop_tolerant:
             print("Early stopping triggered.")
