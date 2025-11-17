@@ -74,6 +74,77 @@ print(device)
 
 sequences[0].shape
 
+"""Apply Feature Selection and Rebuild Dataloaders"""
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+import numpy as np
+
+# Prepare data for RandomForestClassifier using the test data and true anomalies
+# We will use the test data (metric_test_tensor) and the true anomaly labels (true_anomalies)
+# to train the RandomForestClassifier for feature importance calculation.
+
+# Flatten the test sequences for the RandomForestClassifier
+n_samples_test, n_timesteps, n_features = np.array(test_sequences).shape
+X_test_flat = np.array(test_sequences).reshape(n_samples_test, n_timesteps * n_features)
+y_test_true = true_anomalies[:n_samples_test] # Use the true anomalies as the target
+
+# Initialize and train the RandomForestClassifier
+# We use a simple setup for demonstration. Hyperparameter tuning might be needed for optimal results.
+# The goal here is not to build a perfect anomaly detection model with RF, but to get feature importances.
+rf_model = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+rf_model.fit(X_test_flat, y_test_true)
+
+# Get feature importances
+feature_importances = rf_model.feature_importances_
+
+# The feature importances are for the flattened features (timesteps * features).
+# We need to map these back to the original features.
+# We can average the importance scores for each original feature across all timesteps.
+original_feature_importances = feature_importances.reshape(n_timesteps, n_features).mean(axis=0)
+
+# Rank features by importance
+ranked_features_indices = np.argsort(original_feature_importances)[::-1]
+ranked_features_importance = original_feature_importances[ranked_features_indices]
+
+print("Feature Importances (averaged across timesteps):")
+for i, index in enumerate(ranked_features_indices):
+    print(f"Feature {index}: {ranked_features_importance[i]:.4f}")
+
+# Determine the number of top features to select (e.g., top 20)
+num_selected_features = 25 # You can adjust this number
+
+# Get the indices of the top N features
+selected_feature_indices = ranked_features_indices[:num_selected_features]
+print(f"\nSelected Top {num_selected_features} Feature Indices: {selected_feature_indices}")
+
+print(sequences[0].shape)
+
+# Select only the top features for the datasets
+metric_tensor_selected = metric_tensor[:, selected_feature_indices]
+metric_test_tensor_selected = metric_test_tensor[:, selected_feature_indices]
+
+# Create sequences and dataloaders with selected features
+sequence_length = 30
+sequences_selected = []
+for i in range(metric_tensor_selected.shape[0] - sequence_length + 1):
+  sequences_selected.append(metric_tensor_selected[i:i + sequence_length])
+
+train_data_selected, val_data_selected = train_test_split(sequences_selected, test_size=0.3, random_state=42)
+
+test_sequences_selected = []
+for i in range(metric_test_tensor_selected.shape[0] - sequence_length + 1):
+  test_sequences_selected.append(metric_test_tensor_selected[i:i + sequence_length])
+
+batch_size = 32
+train_loader_selected = DataLoader(dataset=train_data_selected, batch_size=batch_size, shuffle=True)
+val_loader_selected = DataLoader(dataset=val_data_selected, batch_size=batch_size, shuffle=False)
+test_loader_selected = DataLoader(dataset=test_sequences_selected, batch_size=batch_size, shuffle=False)
+
+# Update input dimension for the model with the number of selected features
+input_dim_selected = len(selected_feature_indices)
+print(f"New input dimension for the model: {input_dim_selected}")
+
+
 """## Stacked"""
 
 class LSTMEncoder(nn.Module):
@@ -167,7 +238,7 @@ class LSTMVAE_Stacked(nn.Module):
 
         return x_recon, mean_combined, logvar_combined
 
-num_sensors = 38
+num_sensors = len(selected_feature_indices)
 input_dim = 1
 hidden_dim = 128
 latent_dim = 32
@@ -305,7 +376,7 @@ def train_model(model, train_loader, val_loader, optimizer, loss_fn, scheduler, 
     print("Finished Training.")
     return train_losses, val_losses
 
-train_losses, val_losses = train_model(model, train_loader, val_loader, optimizer, loss_function, scheduler, num_epochs=100, device=device)
+train_losses, val_losses = train_model(model, train_loader_selected, val_loader_selected, optimizer, loss_function, scheduler, num_epochs=3, device=device)
 
 save_model(model, 'vae_stacked')
 
@@ -334,7 +405,7 @@ def evaluate_lstm(model, test_loader, device, percentile_threshold=90):
     # Identify anomaly indices
     anomaly_indices = [i for i, score in enumerate(anomaly_scores) if score > threshold]
     return anomaly_indices
-anomalies = evaluate_lstm(model, test_loader, device, 90)
+anomalies = evaluate_lstm(model, test_loader_selected, device, 90)
 
 def calculate_f1_score(anomaly_indices, true_anomalies):
     # Create a binary array representing predicted anomalies
