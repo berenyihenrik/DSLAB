@@ -23,7 +23,7 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import f1_score, classification_report, confusion_matrix, roc_auc_score
+from sklearn.metrics import f1_score, classification_report, confusion_matrix, roc_auc_score, average_precision_score
 from torch.cuda.amp import autocast, GradScaler
 
 """## Setup the dataset"""
@@ -469,6 +469,9 @@ print(f"F1 Score: {f1}")
 
 auc_roc = roc_auc_score(true_anomalies, predicted_anomalies)
 print(f"AUC-ROC Score: {auc_roc}")
+
+auc_pr = average_precision_score(true_anomalies, predicted_anomalies)
+print(f"AUCPR Score: {auc_pr}")
 
 print(classification_report(true_anomalies, predicted_anomalies))
 print(confusion_matrix(true_anomalies, predicted_anomalies))
