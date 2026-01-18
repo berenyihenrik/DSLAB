@@ -1,16 +1,13 @@
 # -*- coding: utf-8 -*-
-"""LSTM VAE stacked for NASA SMAP/MSL datasets.
+"""LSTM VAE stacked for SMD (Server Machine Dataset).
 
 Main entry point that orchestrates data loading, feature selection,
 model training, hyperparameter optimization, and evaluation.
 
-Refactored to work with NASA SMAP (Soil Moisture Active Passive satellite) and
-MSL (Mars Science Laboratory rover) anomaly detection datasets.
+Refactored to work with SMD (Server Machine Dataset) for anomaly detection.
 """
 
-import ast
 import numpy as np
-import pandas as pd
 import torch
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -19,12 +16,12 @@ from sklearn.model_selection import train_test_split
 
 # Import from modular components
 from config import (
-    DATASET_TYPE, DRIVE, CHANNEL, LABELS_FILE,
+    SMD_DRIVE, MACHINE,
     SEQUENCE_LENGTH, INPUT_DIM, HIDDEN_DIM, LATENT_DIM, NUM_LAYERS,
     BATCH_SIZE, NUM_EPOCHS, USE_OPTUNA, N_OPTUNA_TRIALS, DEFAULT_PARAMS, DEVICE
 )
 from data_loader import (
-    load_smap_msl_data, get_available_channels, preprocess_data,
+    load_smd_data, get_available_machines, preprocess_data,
     create_sequences, create_combined_sequences
 )
 from models import LSTMVAE_Stacked_Weighted
@@ -33,8 +30,8 @@ from optuna_tuning import (
     create_optuna_objective, run_optuna_study, evaluate_for_optuna
 )
 from evaluation import (
-    evaluate_lstm_weighted, calculate_f1_score_smap_msl,
-    point_adjust_f1_score, print_evaluation_results
+    evaluate_lstm_weighted, calculate_f1_score,
+    print_evaluation_results_simple
 )
 from visualization import (
     visualize_optuna_study, print_optuna_summary, print_final_summary
@@ -43,15 +40,15 @@ from feature_selection import perform_feature_selection, split_features_by_indic
 
 
 def main():
-    """Main execution function."""
+    """Main execution function for SMD dataset."""
     
-    # Print available channels
-    print(f"Available {DATASET_TYPE} channels:")
-    available_channels = get_available_channels(DRIVE, DATASET_TYPE)
-    print(available_channels[:10], "..." if len(available_channels) > 10 else "")
+    # Print available machines
+    print("Available SMD machines:")
+    available_machines = get_available_machines(SMD_DRIVE)
+    print(available_machines[:10], "..." if len(available_machines) > 10 else "")
     
     # Load the dataset
-    metric_tensor, metric_test_tensor, true_anomalies = load_smap_msl_data(CHANNEL, DRIVE, DATASET_TYPE)
+    metric_tensor, metric_test_tensor, true_anomalies = load_smd_data(MACHINE, SMD_DRIVE)
     
     # Convert to float32 for PyTorch compatibility
     metric_tensor = metric_tensor.astype(np.float32)
@@ -130,11 +127,14 @@ def main():
             true_anomalies, device
         )
         
+        # Extract machine name without extension for study naming
+        machine_name = MACHINE.replace('.txt', '')
+        
         study = run_optuna_study(
             objective_fn, 
             n_trials=N_OPTUNA_TRIALS,
-            dataset_type=DATASET_TYPE,
-            channel=CHANNEL
+            dataset_type="SMD",
+            channel=machine_name
         )
         best_params = study.best_params
         if 'kl_weight' not in best_params:
@@ -202,7 +202,8 @@ def main():
     )
     
     # Save the model
-    model_name = f'vae_stacked_weighted_{DATASET_TYPE}_{CHANNEL}_optuna'
+    machine_name = MACHINE.replace('.txt', '')
+    model_name = f'vae_stacked_weighted_SMD_{machine_name}_optuna'
     save_model(model, model_name, input_dim, final_latent_dim, final_hidden_dim)
     print(f"\nOptimized model saved as: {model_name}.pth")
     
@@ -216,28 +217,23 @@ def main():
     threshold_value = np.percentile(anomaly_scores, final_percentile_threshold)
     anomalies = [i for i, score in enumerate(anomaly_scores) if score > threshold_value]
     
-    # Get anomaly sequences for point-adjust evaluation
-    labels_df = pd.read_csv(LABELS_FILE)
-    channel_labels = labels_df[labels_df['chan_id'] == CHANNEL]
-    anomaly_sequences = ast.literal_eval(channel_labels['anomaly_sequences'].iloc[0])
-    
-    # Print evaluation results
-    f1, pa_results, predicted_anomalies, adjusted_true_anomalies = print_evaluation_results(
+    # Print evaluation results (without point-adjust for SMD)
+    f1, predicted_anomalies, adjusted_true_anomalies = print_evaluation_results_simple(
         anomaly_scores, anomalies, true_anomalies, sequence_length,
-        final_percentile_threshold, anomaly_sequences
+        final_percentile_threshold
     )
     
     # Visualize Optuna results if optimization was run
     if USE_OPTUNA and 'study' in dir():
-        print_optuna_summary(study, DATASET_TYPE, CHANNEL)
-        visualize_optuna_study(study, save_path=f'optuna_{DATASET_TYPE}_{CHANNEL}',
-                              dataset_name=DATASET_TYPE, identifier=CHANNEL)
+        print_optuna_summary(study, "SMD", machine_name)
+        visualize_optuna_study(study, save_path=f'optuna_SMD_{machine_name}',
+                              dataset_name="SMD", identifier=machine_name)
     
-    # Print final summary
-    print_final_summary(DATASET_TYPE, CHANNEL, best_params, f1, pa_results)
+    # Print final summary (without point-adjust results)
+    print_final_summary("SMD", machine_name, best_params, f1, pa_results=None)
     
-    return model, best_params, f1, pa_results
+    return model, best_params, f1
 
 
 if __name__ == "__main__":
-    model, best_params, f1, pa_results = main()
+    model, best_params, f1 = main()

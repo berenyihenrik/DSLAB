@@ -78,6 +78,10 @@ def calculate_f1_score_smap_msl(anomaly_indices, true_anomalies, sequence_length
     return f1, predicted_anomalies, adjusted_true_anomalies
 
 
+# Alias for backward compatibility and generic usage
+calculate_f1_score = calculate_f1_score_smap_msl
+
+
 def point_adjust_f1_score(anomaly_indices, true_anomalies, sequence_length, anomaly_sequences):
     """
     Calculate Point-Adjust F1 score used in SMAP/MSL literature.
@@ -191,3 +195,55 @@ def print_evaluation_results(anomaly_scores, anomalies, true_anomalies, sequence
     print(f"  Detected Segments: {pa_results['true_positives']} / {pa_results['total_segments']}")
     
     return f1, pa_results, predicted_anomalies, adjusted_true_anomalies
+
+
+def print_evaluation_results_simple(anomaly_scores, anomalies, true_anomalies, sequence_length, 
+                                    percentile_threshold):
+    """
+    Print evaluation results without point-adjust metrics (for SMD dataset).
+    
+    Args:
+        anomaly_scores: List of anomaly scores
+        anomalies: List of detected anomaly indices
+        true_anomalies: Ground truth anomaly labels
+        sequence_length: Sequence length used
+        percentile_threshold: Percentile threshold used
+    
+    Returns:
+        f1: F1 score
+        predicted_anomalies: Binary prediction array
+        adjusted_true_anomalies: Adjusted ground truth labels
+    """
+    threshold_value = np.percentile(anomaly_scores, percentile_threshold)
+    
+    print("\n--- Anomaly Score Diagnostics ---")
+    print(f"Anomaly scores - Min: {np.min(anomaly_scores):.4f}, Max: {np.max(anomaly_scores):.4f}")
+    print(f"Anomaly scores - Mean: {np.mean(anomaly_scores):.4f}, Std: {np.std(anomaly_scores):.4f}")
+    print(f"Threshold percentile: {percentile_threshold}")
+    print(f"Threshold value: {threshold_value:.4f}")
+    print(f"Number of detected anomalies: {len(anomalies)}")
+    print(f"True anomaly rate: {np.sum(true_anomalies) / len(true_anomalies) * 100:.2f}%")
+    
+    # Calculate F1 score
+    f1, predicted_anomalies, adjusted_true_anomalies = calculate_f1_score(
+        anomalies, true_anomalies, sequence_length
+    )
+    print(f"\nF1 Score (with threshold percentile {percentile_threshold}): {f1:.4f}")
+    
+    # Calculate AUC-ROC if we have both classes
+    unique_true = np.unique(adjusted_true_anomalies)
+    if len(unique_true) > 1:
+        auc_roc = roc_auc_score(adjusted_true_anomalies, predicted_anomalies)
+        print(f"AUC-ROC Score: {auc_roc:.4f}")
+        
+        auc_pr = average_precision_score(adjusted_true_anomalies, predicted_anomalies)
+        print(f"AUCPR Score: {auc_pr:.4f}")
+    else:
+        print("Warning: Only one class in true labels, cannot compute AUC-ROC or AUCPR")
+    
+    print("\nClassification Report:")
+    print(classification_report(adjusted_true_anomalies, predicted_anomalies, zero_division=0))
+    print("Confusion Matrix:")
+    print(confusion_matrix(adjusted_true_anomalies, predicted_anomalies))
+    
+    return f1, predicted_anomalies, adjusted_true_anomalies

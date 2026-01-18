@@ -1,22 +1,40 @@
 # -*- coding: utf-8 -*-
-"""Configuration settings for LSTM VAE stacked SMAP/MSL anomaly detection."""
+"""Configuration settings for LSTM VAE stacked anomaly detection."""
 
 import os
 import torch
 
-# Dataset configuration for NASA SMAP/MSL
+# =============================================================================
+# SMAP/MSL Dataset Configuration
+# =============================================================================
 # DATASET_TYPE can be "SMAP" or "MSL"
 DATASET_TYPE = "MSL"  # Change to "MSL" for Mars Science Laboratory dataset
-DRIVE = "/mnt/c/Users/beren/Desktop/DSLAB/datasets/SMAP_MSL/"
+SMAP_DRIVE = "/mnt/c/Users/beren/Desktop/DSLAB/datasets/SMAP_MSL/"
 
 # Available channels for SMAP and MSL (from labeled_anomalies.csv)
 # You can change CHANNEL to any valid channel ID
 CHANNEL = "M-1"  # Example: P-1, S-1, E-1, etc. for SMAP; M-1, C-1, T-4, etc. for MSL
 
 # Paths for SMAP/MSL dataset
-TRAIN_DATASET = os.path.join(DRIVE, "data/data", "train", f"{CHANNEL}.npy")
-TEST_DATASET = os.path.join(DRIVE, "data/data", "test", f"{CHANNEL}.npy")
-LABELS_FILE = os.path.join(DRIVE, "labeled_anomalies.csv")
+SMAP_TRAIN_DATASET = os.path.join(SMAP_DRIVE, "data/data", "train", f"{CHANNEL}.npy")
+SMAP_TEST_DATASET = os.path.join(SMAP_DRIVE, "data/data", "test", f"{CHANNEL}.npy")
+LABELS_FILE = os.path.join(SMAP_DRIVE, "labeled_anomalies.csv")
+
+# Legacy alias for backward compatibility
+DRIVE = SMAP_DRIVE
+
+# =============================================================================
+# SMD (Server Machine Dataset) Configuration
+# =============================================================================
+SMD_DRIVE = "/mnt/c/Users/beren/Desktop/DSLAB/datasets/ServerMachineDataset/"
+
+# Machine identifier (e.g., "machine-1-1.txt", "machine-2-1.txt")
+MACHINE = "machine-1-1.txt"
+
+# Paths for SMD dataset
+SMD_TRAIN_DATASET = os.path.join(SMD_DRIVE, "train", MACHINE)
+SMD_TEST_DATASET = os.path.join(SMD_DRIVE, "test", MACHINE)
+SMD_TEST_LABEL_DATASET = os.path.join(SMD_DRIVE, "test_label", MACHINE)
 
 # Model hyperparameters (defaults)
 SEQUENCE_LENGTH = 30

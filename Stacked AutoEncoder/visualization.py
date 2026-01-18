@@ -6,15 +6,15 @@ import matplotlib.pyplot as plt
 from optuna.trial import TrialState
 
 
-def visualize_optuna_study(study, save_path=None, dataset_type="MSL", channel="M-1"):
+def visualize_optuna_study(study, save_path=None, dataset_name="MSL", identifier="M-1"):
     """
     Generate visualizations for Optuna study results.
     
     Args:
         study: Optuna study object
         save_path: Optional path prefix to save figures
-        dataset_type: Dataset type for titles
-        channel: Channel for titles
+        dataset_name: Dataset name for titles (e.g., "MSL", "SMAP", "SMD")
+        identifier: Channel or machine identifier for titles
     """
     # Create figure for optimization history
     fig1, ax1 = plt.subplots(figsize=(10, 6))
@@ -34,7 +34,7 @@ def visualize_optuna_study(study, save_path=None, dataset_type="MSL", channel="M
     
     ax1.set_xlabel('Trial Number')
     ax1.set_ylabel('F1 Score')
-    ax1.set_title(f'Optuna Optimization History - {dataset_type} {channel}')
+    ax1.set_title(f'Optuna Optimization History - {dataset_name} {identifier}')
     ax1.legend()
     ax1.grid(True, alpha=0.3)
     
@@ -69,7 +69,7 @@ def visualize_optuna_study(study, save_path=None, dataset_type="MSL", channel="M
             
             ax2.set_xlabel('Top Encoder Weight')
             ax2.set_ylabel('F1 Score')
-            ax2.set_title(f'Encoder Weight vs Model Performance - {dataset_type} {channel}')
+            ax2.set_title(f'Encoder Weight vs Model Performance - {dataset_name} {identifier}')
             ax2.legend()
             ax2.grid(True, alpha=0.3)
             
@@ -101,27 +101,27 @@ def visualize_optuna_study(study, save_path=None, dataset_type="MSL", channel="M
                 axes[idx].set_title(f'{param_name} vs F1 Score')
                 axes[idx].grid(True, alpha=0.3)
     
-    plt.suptitle(f'Parameter Analysis - {dataset_type} {channel}')
+    plt.suptitle(f'Parameter Analysis - {dataset_name} {identifier}')
     plt.tight_layout()
     if save_path:
         plt.savefig(f'{save_path}_parameter_analysis.png', dpi=150, bbox_inches='tight')
     plt.show()
 
 
-def print_optuna_summary(study, dataset_type="MSL", channel="M-1"):
+def print_optuna_summary(study, dataset_name="MSL", identifier="M-1"):
     """
     Print a detailed summary of the Optuna study results.
     
     Args:
         study: Optuna study object
-        dataset_type: Dataset type for display
-        channel: Channel for display
+        dataset_name: Dataset name for display (e.g., "MSL", "SMAP", "SMD")
+        identifier: Channel or machine identifier for display
     """
     print("\n" + "=" * 70)
     print("OPTUNA HYPERPARAMETER OPTIMIZATION SUMMARY")
     print("=" * 70)
     
-    print(f"\nDataset: {dataset_type}, Channel: {channel}")
+    print(f"\nDataset: {dataset_name}, Identifier: {identifier}")
     print(f"Total trials: {len(study.trials)}")
     
     completed = [t for t in study.trials if t.state == TrialState.COMPLETE]
@@ -156,21 +156,21 @@ def print_optuna_summary(study, dataset_type="MSL", channel="M-1"):
     print("=" * 70)
 
 
-def print_final_summary(dataset_type, channel, best_params, f1, pa_results):
+def print_final_summary(dataset_name, identifier, best_params, f1, pa_results=None):
     """
     Print final model performance summary.
     
     Args:
-        dataset_type: Dataset type
-        channel: Channel
+        dataset_name: Dataset name (e.g., "MSL", "SMAP", "SMD")
+        identifier: Channel or machine identifier
         best_params: Best hyperparameters dictionary
         f1: Point-wise F1 score
-        pa_results: Point-adjust evaluation results
+        pa_results: Point-adjust evaluation results (optional, for SMAP/MSL)
     """
     print("\n" + "=" * 70)
     print("FINAL MODEL PERFORMANCE SUMMARY")
     print("=" * 70)
-    print(f"\nDataset: {dataset_type}, Channel: {channel}")
+    print(f"\nDataset: {dataset_name}, Identifier: {identifier}")
     print(f"\nOptimized Hyperparameters:")
     print(f"  top_weight: {best_params['top_weight']:.4f}")
     print(f"  remaining_weight: {1.0 - best_params['top_weight']:.4f}")
@@ -182,6 +182,7 @@ def print_final_summary(dataset_type, channel, best_params, f1, pa_results):
     print(f"  percentile_threshold: {best_params['percentile_threshold']}")
     print(f"\nPerformance Metrics:")
     print(f"  Point-wise F1 Score: {f1:.4f}")
-    print(f"  Point-Adjust F1 Score: {pa_results['f1']:.4f}")
-    print(f"  Detected Anomaly Segments: {pa_results['true_positives']} / {pa_results['total_segments']}")
+    if pa_results is not None:
+        print(f"  Point-Adjust F1 Score: {pa_results['f1']:.4f}")
+        print(f"  Detected Anomaly Segments: {pa_results['true_positives']} / {pa_results['total_segments']}")
     print("=" * 70)

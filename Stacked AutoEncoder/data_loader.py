@@ -1,11 +1,15 @@
 # -*- coding: utf-8 -*-
-"""Data loading and preprocessing functions for SMAP/MSL datasets."""
+"""Data loading and preprocessing functions for SMAP/MSL and SMD datasets."""
 
 import os
 import ast
 import numpy as np
 import pandas as pd
 
+
+# =============================================================================
+# SMAP/MSL Dataset Functions
+# =============================================================================
 
 def load_smap_msl_data(channel, drive_path, dataset_type=None):
     """
@@ -99,6 +103,69 @@ def get_available_channels(drive_path, dataset_type=None):
     channels = labels_df['chan_id'].unique().tolist()
     return channels
 
+
+# =============================================================================
+# SMD (Server Machine Dataset) Functions
+# =============================================================================
+
+def load_smd_data(machine, drive_path):
+    """
+    Load SMD (Server Machine Dataset) for a given machine.
+    
+    Args:
+        machine: Machine identifier (e.g., 'machine-1-1.txt')
+        drive_path: Base path to the ServerMachineDataset
+    
+    Returns:
+        train_data: numpy array of training data
+        test_data: numpy array of test data
+        true_anomalies: numpy array of binary anomaly labels for test data
+    """
+    train_path = os.path.join(drive_path, "train", machine)
+    test_path = os.path.join(drive_path, "test", machine)
+    label_path = os.path.join(drive_path, "test_label", machine)
+    
+    print(f"Loading training data from: {train_path}")
+    print(f"Loading test data from: {test_path}")
+    print(f"Loading labels from: {label_path}")
+    
+    # Load CSV files (no header)
+    train_df = pd.read_csv(train_path, header=None)
+    test_df = pd.read_csv(test_path, header=None)
+    true_anomalies = pd.read_csv(label_path, header=None)[0].to_numpy()
+    
+    train_data = train_df.values
+    test_data = test_df.values
+    
+    print(f"Train data shape: {train_data.shape}")
+    print(f"Test data shape: {test_data.shape}")
+    print(f"Total anomalous points: {np.sum(true_anomalies)} / {len(true_anomalies)}")
+    print(f"Anomaly rate: {np.sum(true_anomalies) / len(true_anomalies) * 100:.2f}%")
+    
+    return train_data, test_data, true_anomalies
+
+
+def get_available_machines(drive_path):
+    """
+    Get list of available machines from the SMD dataset directory.
+    
+    Args:
+        drive_path: Base path to the ServerMachineDataset
+    
+    Returns:
+        List of available machine filenames
+    """
+    train_path = os.path.join(drive_path, "train")
+    if os.path.exists(train_path):
+        machines = [f for f in os.listdir(train_path) if f.endswith('.txt')]
+        machines.sort()
+        return machines
+    return []
+
+
+# =============================================================================
+# Common Preprocessing Functions
+# =============================================================================
 
 def preprocess_data(data):
     """
