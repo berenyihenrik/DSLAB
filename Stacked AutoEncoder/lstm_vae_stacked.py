@@ -15,6 +15,9 @@ import pandas as pd
 import pickle
 import copy
 import time
+import os
+import ast
+import joblib
 from tqdm import trange,tqdm
 import torch.nn as nn
 from torch.optim import Adam
@@ -25,6 +28,8 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import f1_score, classification_report, confusion_matrix, roc_auc_score, average_precision_score
 from torch.cuda.amp import autocast, GradScaler
+import optuna
+from optuna.trial import TrialState
 
 """## Setup the dataset"""
 
@@ -70,7 +75,10 @@ train_loader = DataLoader(dataset=train_data, batch_size=batch_size, shuffle=Tru
 val_loader = DataLoader(dataset=val_data, batch_size=batch_size, shuffle=False)
 test_loader = DataLoader(dataset=test_sequences, batch_size=batch_size, shuffle=False)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(device)
+print(f"Using device: {device}")
+
+print(f"Sequence shape: {sequences[0].shape}")
+print(f"Number of features: {metric_tensor.shape[1]}")
 
 sequences[0].shape
 
@@ -83,41 +91,71 @@ import numpy as np
 # We will use the test data (metric_test_tensor) and the true anomaly labels (true_anomalies)
 # to train the RandomForestClassifier for feature importance calculation.
 
+# Adjust true_anomalies to match test_sequences length (due to windowing)
+# Each sequence covers positions i to i+sequence_length-1
+# We assign the label of the last position in each sequence
+adjusted_true_anomalies = true_anomalies[sequence_length-1:]
+
 # Flatten the test sequences for the RandomForestClassifier
 n_samples_test, n_timesteps, n_features = np.array(test_sequences).shape
 X_test_flat = np.array(test_sequences).reshape(n_samples_test, n_timesteps * n_features)
-y_test_true = true_anomalies[:n_samples_test] # Use the true anomalies as the target
+y_test_true = adjusted_true_anomalies[:n_samples_test] # Use the true anomalies as the target
 
-# Initialize and train the RandomForestClassifier
-# We use a simple setup for demonstration. Hyperparameter tuning might be needed for optimal results.
-# The goal here is not to build a perfect anomaly detection model with RF, but to get feature importances.
-rf_model = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
-rf_model.fit(X_test_flat, y_test_true)
+print(f"Test sequences shape: {n_samples_test}, {n_timesteps}, {n_features}")
+print(f"Adjusted labels length: {len(y_test_true)}")
 
-# Get feature importances
-feature_importances = rf_model.feature_importances_
+# Check if we have both classes for training RF
+unique_classes = np.unique(y_test_true)
+print(f"Unique classes in labels: {unique_classes}")
 
-# The feature importances are for the flattened features (timesteps * features).
-# We need to map these back to the original features.
-# We can average the importance scores for each original feature across all timesteps.
-original_feature_importances = feature_importances.reshape(n_timesteps, n_features).mean(axis=0)
+if len(unique_classes) < 2:
+    print("Warning: Only one class present in labels. Using all features without RF selection.")
+    # Use all features if we can't train RF
+    n_features_total = metric_tensor.shape[1]
+    num_selected_features = min(25, n_features_total)
+    selected_feature_indices = np.arange(num_selected_features)
+    remaining_feature_indices = np.arange(num_selected_features, n_features_total)
+else:
+    # Initialize and train the RandomForestClassifier
+    # We use a simple setup for demonstration. Hyperparameter tuning might be needed for optimal results.
+    # The goal here is not to build a perfect anomaly detection model with RF, but to get feature importances.
+    rf_model = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+    rf_model.fit(X_test_flat, y_test_true)
 
-# Rank features by importance
-ranked_features_indices = np.argsort(original_feature_importances)[::-1]
-ranked_features_importance = original_feature_importances[ranked_features_indices]
+    # Get feature importances
+    feature_importances = rf_model.feature_importances_
 
-print("Feature Importances (averaged across timesteps):")
-for i, index in enumerate(ranked_features_indices):
-    print(f"Feature {index}: {ranked_features_importance[i]:.4f}")
+    # The feature importances are for the flattened features (timesteps * features).
+    # We need to map these back to the original features.
+    # We can average the importance scores for each original feature across all timesteps.
+    original_feature_importances = feature_importances.reshape(n_timesteps, n_features).mean(axis=0)
 
-# Determine the number of top features to select (e.g., top 20)
-num_selected_features = 25 # You can adjust this number
+    # Rank features by importance
+    ranked_features_indices = np.argsort(original_feature_importances)[::-1]
+    ranked_features_importance = original_feature_importances[ranked_features_indices]
 
-# Get the indices of the top N features
-selected_feature_indices = ranked_features_indices[:num_selected_features]
-remaining_feature_indices = ranked_features_indices[num_selected_features:]
-print(f"\nSelected Top {num_selected_features} Feature Indices: {selected_feature_indices}")
-print(f"\nRemaining {len(remaining_feature_indices)} Feature Indices: {remaining_feature_indices}")
+    print("Feature Importances (averaged across timesteps):")
+    for i, index in enumerate(ranked_features_indices):
+        print(f"Feature {index}: {ranked_features_importance[i]:.4f}")
+
+    # Determine the number of top features to select
+    # We adapt based on total features available
+    n_features_total = n_features
+    num_selected_features = min(25, max(1, n_features_total // 2))  # At least 1, at most 25 or half
+
+    # Get the indices of the top N features
+    selected_feature_indices = ranked_features_indices[:num_selected_features]
+    remaining_feature_indices = ranked_features_indices[num_selected_features:]
+
+print(f"\nSelected Top {len(selected_feature_indices)} Feature Indices: {selected_feature_indices}")
+print(f"Remaining {len(remaining_feature_indices)} Feature Indices: {remaining_feature_indices}")
+
+# Handle case where we have very few features
+if len(remaining_feature_indices) == 0:
+    print("Warning: No remaining features. Using half of selected features as remaining.")
+    mid = len(selected_feature_indices) // 2
+    remaining_feature_indices = selected_feature_indices[mid:]
+    selected_feature_indices = selected_feature_indices[:mid]
 
 # Select only the top features for the datasets
 metric_tensor_selected = metric_tensor[:, selected_feature_indices]
@@ -303,15 +341,21 @@ print(f"Output top shape: {output_top.shape}, Output remaining shape: {output_re
 """## Support functions"""
 
 def loss_function_weighted(x_top, x_remaining, x_hat_top, x_hat_remaining, mean, log_var, top_weight=0.7, remaining_weight=0.3):
-    reproduction_loss_top = nn.functional.mse_loss(x_hat_top, x_top, reduction='sum')
-    reproduction_loss_remaining = nn.functional.mse_loss(x_hat_remaining, x_remaining, reduction='sum')
+    # Ensure shapes match - reshape reconstructions if needed
+    if x_hat_top.shape != x_top.shape:
+        x_hat_top = x_hat_top.view_as(x_top)
+    if x_hat_remaining.shape != x_remaining.shape:
+        x_hat_remaining = x_hat_remaining.view_as(x_remaining)
     
-    # Weighted reconstruction loss
+    reproduction_loss_top = nn.functional.mse_loss(x_hat_top, x_top, reduction='mean')
+    reproduction_loss_remaining = nn.functional.mse_loss(x_hat_remaining, x_remaining, reduction='mean')
+    
     reproduction_loss = top_weight * reproduction_loss_top + remaining_weight * reproduction_loss_remaining
     
-    KLD = -0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
+    KLD = -0.5 * torch.mean(1 + log_var - mean.pow(2) - log_var.exp())
+    beta = 0.1
     
-    return reproduction_loss + KLD
+    return reproduction_loss + beta * KLD
 
 def save_model(model, name):
     model_state = {
@@ -418,14 +462,366 @@ def train_model_weighted(model, train_loader, val_loader, optimizer, loss_fn, sc
     print("Finished Training.")
     return train_losses, val_losses
 
+"""## Optuna Hyperparameter Tuning
+
+This section implements hyperparameter optimization using Optuna, focusing on:
+- Encoder weights (top_weight, remaining_weight)
+- Model architecture (hidden_dim, latent_dim, num_layers)
+- Training parameters (learning_rate, batch_size)
+- Detection threshold (percentile_threshold)
+"""
+
+def train_model_for_optuna(model, train_loader, val_loader, optimizer, loss_fn, num_epochs=20, device='cpu', trial=None):
+    torch.cuda.empty_cache()
+    train_losses = []
+    val_losses = []
+
+    early_stop_tolerant_count = 0
+    early_stop_tolerant = 5  # Shorter patience for Optuna trials
+    best_loss = float('inf')
+    best_model_wts = copy.deepcopy(model.state_dict())
+
+    for epoch in range(num_epochs):
+        train_loss = 0.0
+        model.train()
+        
+        for batch_top, batch_remaining in train_loader:
+            batch_top = torch.tensor(batch_top, dtype=torch.float32).to(device)
+            batch_remaining = torch.tensor(batch_remaining, dtype=torch.float32).to(device)
+            
+            optimizer.zero_grad()
+            
+            recon_top, recon_remaining, mean, logvar = model(batch_top, batch_remaining)
+            loss = loss_fn(batch_top, batch_remaining, recon_top, recon_remaining, mean, logvar, 
+                          model.top_weight, model.remaining_weight)
+            
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
+
+        train_loss /= len(train_loader)
+        train_losses.append(train_loss)
+
+        # Validation
+        model.eval()
+        valid_loss = 0.0
+        with torch.no_grad():
+            for batch_top, batch_remaining in val_loader:
+                batch_top = torch.tensor(batch_top, dtype=torch.float32).to(device)
+                batch_remaining = torch.tensor(batch_remaining, dtype=torch.float32).to(device)
+                
+                recon_top, recon_remaining, mean, logvar = model(batch_top, batch_remaining)
+                loss = loss_fn(batch_top, batch_remaining, recon_top, recon_remaining, mean, logvar,
+                              model.top_weight, model.remaining_weight)
+                valid_loss += loss.item()
+
+        valid_loss /= len(val_loader)
+        val_losses.append(valid_loss)
+
+        if valid_loss < best_loss:
+            best_loss = valid_loss
+            best_model_wts = copy.deepcopy(model.state_dict())
+            early_stop_tolerant_count = 0
+        else:
+            early_stop_tolerant_count += 1
+
+        # Report to Optuna for pruning
+        if trial is not None:
+            trial.report(valid_loss, epoch)
+            if trial.should_prune():
+                raise optuna.exceptions.TrialPruned()
+
+        if early_stop_tolerant_count >= early_stop_tolerant:
+            break
+
+    model.load_state_dict(best_model_wts)
+    return train_losses, val_losses, best_loss
+
+
+def evaluate_for_optuna(model, test_loader, device, percentile_threshold, true_anomalies, sequence_length):
+    """
+    Evaluation function that returns F1 score for Optuna optimization.
+    Uses the given percentile_threshold directly.
+    
+    Returns:
+        f1: F1 score at the given threshold
+        anomaly_scores: List of anomaly scores for each sequence
+    """
+    model.eval()
+    anomaly_scores = []
+
+    with torch.no_grad():
+        for batch_top, batch_remaining in test_loader:
+            batch_top = torch.tensor(batch_top, dtype=torch.float32).to(device)
+            batch_remaining = torch.tensor(batch_remaining, dtype=torch.float32).to(device)
+
+            batch_scores = []
+            for i in range(batch_top.shape[0]):
+                sequence_top = batch_top[i, :, :].unsqueeze(0)
+                sequence_remaining = batch_remaining[i, :, :].unsqueeze(0)
+                
+                recon_top, recon_remaining, mean, logvar = model(sequence_top, sequence_remaining)
+                loss = loss_function_weighted(sequence_top, sequence_remaining, recon_top, recon_remaining, 
+                                             mean, logvar, model.top_weight, model.remaining_weight)
+                batch_scores.append(loss.item())
+            anomaly_scores.extend(batch_scores)
+
+    # Use the given percentile threshold
+    adjusted_true_anomalies = true_anomalies[sequence_length-1:]
+    
+    threshold = np.percentile(anomaly_scores, percentile_threshold)
+    anomaly_indices = [i for i, score in enumerate(anomaly_scores) if score > threshold]
+    
+    predicted_anomalies = np.zeros(len(adjusted_true_anomalies), dtype=int)
+    for index in anomaly_indices:
+        if index < len(predicted_anomalies):
+            predicted_anomalies[index] = 1
+    
+    f1 = f1_score(adjusted_true_anomalies, predicted_anomalies, zero_division=0)
+    
+    return f1, anomaly_scores
+
+
+def optuna_objective(trial):
+    """
+    Optuna objective function for hyperparameter optimization.
+    
+    Tunes:
+    - top_weight / remaining_weight: Balance between encoder branches
+    - hidden_dim: LSTM hidden layer size
+    - latent_dim: VAE latent space dimension
+    - num_layers: Number of LSTM layers
+    - learning_rate: Optimizer learning rate
+    - batch_size: Training batch size
+    - percentile_threshold: Anomaly detection threshold
+    """
+    global selected_feature_indices, remaining_feature_indices, metric_tensor_top, metric_tensor_remaining
+    global metric_test_tensor_top, metric_test_tensor_remaining, true_anomalies, device
+    
+    # Hyperparameters to tune
+    top_weight = trial.suggest_float("top_weight", 0.3, 0.9)
+    remaining_weight = 1.0 - top_weight  # Ensure weights sum to 1
+    
+    hidden_dim = trial.suggest_categorical("hidden_dim", [64, 128, 256])
+    latent_dim = trial.suggest_categorical("latent_dim", [16, 32, 64])
+    num_layers = trial.suggest_int("num_layers", 1, 2)
+    
+    learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True)
+    batch_size = trial.suggest_categorical("batch_size", [16, 32, 64, 128])
+    
+    kl_weight = trial.suggest_float("kl_weight", 0.01, 1.0, log=True)
+    
+    percentile_threshold = trial.suggest_int("percentile_threshold", 50, 99)
+    
+    seq_length = 30
+    sequences_top = []
+    sequences_remaining = []
+    for i in range(metric_tensor_top.shape[0] - seq_length + 1):
+        sequences_top.append(metric_tensor_top[i:i + seq_length])
+        sequences_remaining.append(metric_tensor_remaining[i:i + seq_length])
+    
+    sequences_combined = list(zip(sequences_top, sequences_remaining))
+    train_data_opt, val_data_opt = train_test_split(sequences_combined, test_size=0.3, random_state=42)
+    
+    test_sequences_top = []
+    test_sequences_remaining = []
+    for i in range(metric_test_tensor_top.shape[0] - seq_length + 1):
+        test_sequences_top.append(metric_test_tensor_top[i:i + seq_length])
+        test_sequences_remaining.append(metric_test_tensor_remaining[i:i + seq_length])
+    
+    test_sequences_opt = list(zip(test_sequences_top, test_sequences_remaining))
+    
+    train_loader_opt = DataLoader(dataset=train_data_opt, batch_size=batch_size, shuffle=True)
+    val_loader_opt = DataLoader(dataset=val_data_opt, batch_size=batch_size, shuffle=False)
+    test_loader_opt = DataLoader(dataset=test_sequences_opt, batch_size=batch_size, shuffle=False)
+    
+    num_top = len(selected_feature_indices)
+    num_remaining = len(remaining_feature_indices)
+    
+    model_opt = LSTMVAE_Stacked_Weighted(
+        num_top_sensors=num_top,
+        num_remaining_sensors=num_remaining,
+        input_dim=1,
+        hidden_dim=hidden_dim,
+        latent_dim=latent_dim,
+        sequence_length=seq_length,
+        num_layers=num_layers,
+        device=device,
+        top_weight=top_weight,
+        remaining_weight=remaining_weight
+    ).to(device)
+    
+    optimizer_opt = Adam(model_opt.parameters(), lr=learning_rate)
+    
+    # Train with fewer epochs for hyperparameter search
+    try:
+        train_losses, val_losses, best_val_loss = train_model_for_optuna(
+            model_opt, train_loader_opt, val_loader_opt, 
+            optimizer_opt, loss_function_weighted, 
+            num_epochs=30, device=device, trial=trial
+        )
+    except optuna.exceptions.TrialPruned:
+        raise
+    except Exception as e:
+        print(f"Trial failed with error: {e}")
+        return 0.0
+    
+    # Evaluate on test set with the suggested threshold
+    f1, _ = evaluate_for_optuna(
+        model_opt, test_loader_opt, device, 
+        percentile_threshold, true_anomalies, seq_length
+    )
+    
+    del model_opt
+    torch.cuda.empty_cache()
+    
+    return f1
+
+
+def run_optuna_study(n_trials=50, study_name="lstm_vae_stacked_weighted"):
+    """
+    Run Optuna hyperparameter optimization study.
+    
+    Args:
+        n_trials: Number of trials to run
+        study_name: Name for the study (used for saving)
+    
+    Returns:
+        study: Completed Optuna study object
+    """
+    # Create study with TPE sampler and median pruner
+    study = optuna.create_study(
+        direction="maximize",  # Maximize F1 score
+        sampler=optuna.samplers.TPESampler(seed=42),
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=10)
+    )
+    
+    print(f"Starting Optuna study with {n_trials} trials...")
+    print("=" * 60)
+    
+    study.optimize(
+        optuna_objective, 
+        n_trials=n_trials,
+        show_progress_bar=True,
+        gc_after_trial=True
+    )
+    
+    print("\n" + "=" * 60)
+    print("Optuna Study Complete!")
+    print("=" * 60)
+    
+    pruned_trials = study.get_trials(deepcopy=False, states=[TrialState.PRUNED])
+    complete_trials = study.get_trials(deepcopy=False, states=[TrialState.COMPLETE])
+    
+    print(f"\nStudy statistics:")
+    print(f"  Number of finished trials: {len(study.trials)}")
+    print(f"  Number of pruned trials: {len(pruned_trials)}")
+    print(f"  Number of complete trials: {len(complete_trials)}")
+    
+    print(f"\nBest trial:")
+    trial = study.best_trial
+    print(f"  Value (F1 Score): {trial.value:.4f}")
+    print(f"\n  Best hyperparameters:")
+    for key, value in trial.params.items():
+        print(f"    {key}: {value}")
+    
+    study_filename = f"{study_name}_study.pkl"
+    joblib.dump(study, study_filename)
+    print(f"\nStudy saved to: {study_filename}")
+    
+    return study
+
+
+USE_OPTUNA = True
+N_OPTUNA_TRIALS = 5
+
+if USE_OPTUNA:
+    study = run_optuna_study(n_trials=N_OPTUNA_TRIALS)
+    best_params = study.best_params
+    if 'kl_weight' not in best_params:
+        best_params['kl_weight'] = 0.1
+    print("\nUsing optimized hyperparameters for final training...")
+else:
+    # Default or previously optimized parameters
+    best_params = {
+        'top_weight': 0.7,
+        'hidden_dim': 128,
+        'latent_dim': 32,
+        'num_layers': 1,
+        'learning_rate': 1e-3,
+        'batch_size': 32,
+        'percentile_threshold': 90,
+        'kl_weight': 0.1
+    }
+    print("Using default hyperparameters...")
+
+print("\nFinal training parameters:")
+for key, value in best_params.items():
+    print(f"  {key}: {value}")
+
+"""## Train Final Model with Best Hyperparameters"""
+final_top_weight = best_params['top_weight']
+final_remaining_weight = 1.0 - final_top_weight
+final_hidden_dim = best_params['hidden_dim']
+final_latent_dim = best_params['latent_dim']
+final_num_layers = best_params['num_layers']
+final_learning_rate = best_params['learning_rate']
+final_batch_size = best_params['batch_size']
+final_percentile_threshold = best_params['percentile_threshold']
+
+sequences_top_final = []
+sequences_remaining_final = []
+for i in range(metric_tensor_top.shape[0] - sequence_length + 1):
+    sequences_top_final.append(metric_tensor_top[i:i + sequence_length])
+    sequences_remaining_final.append(metric_tensor_remaining[i:i + sequence_length])
+
+sequences_combined_final = list(zip(sequences_top_final, sequences_remaining_final))
+train_data_final, val_data_final = train_test_split(sequences_combined_final, test_size=0.3, random_state=42)
+
+test_sequences_top_final = []
+test_sequences_remaining_final = []
+for i in range(metric_test_tensor_top.shape[0] - sequence_length + 1):
+    test_sequences_top_final.append(metric_test_tensor_top[i:i + sequence_length])
+    test_sequences_remaining_final.append(metric_test_tensor_remaining[i:i + sequence_length])
+
+test_sequences_combined_final = list(zip(test_sequences_top_final, test_sequences_remaining_final))
+
+train_loader_final = DataLoader(dataset=train_data_final, batch_size=final_batch_size, shuffle=True)
+val_loader_final = DataLoader(dataset=val_data_final, batch_size=final_batch_size, shuffle=False)
+test_loader_final = DataLoader(dataset=test_sequences_combined_final, batch_size=final_batch_size, shuffle=False)
+
+model = LSTMVAE_Stacked_Weighted(
+    num_top_sensors=num_top_sensors,
+    num_remaining_sensors=num_remaining_sensors,
+    input_dim=input_dim,
+    hidden_dim=final_hidden_dim,
+    latent_dim=final_latent_dim,
+    sequence_length=sequence_length,
+    num_layers=final_num_layers,
+    device=device,
+    top_weight=final_top_weight,
+    remaining_weight=final_remaining_weight
+).to(device)
+
+optimizer = Adam(model.parameters(), lr=final_learning_rate)
 scheduler = ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.1)
-train_losses, val_losses = train_model_weighted(model, train_loader_combined, val_loader_combined, 
-                                                 optimizer, loss_function_weighted, scheduler, 
-                                                 num_epochs=50, device=device)
 
-save_model(model, 'vae_stacked_weighted')
+print(f"\nTraining final model with optimized encoder weights:")
+print(f"  top_weight: {final_top_weight:.4f}")
+print(f"  remaining_weight: {final_remaining_weight:.4f}")
 
-"""# Evaluate"""
+train_losses, val_losses = train_model_weighted(
+    model, train_loader_final, val_loader_final, 
+    optimizer, loss_function_weighted, scheduler, 
+    num_epochs=256, device=device
+)
+
+model_name = f'vae_stacked_weighted_optuna'
+save_model(model, model_name)
+print(f"\nOptimized model saved as: {model_name}.pth")
+
+"""# Evaluate with Optimized Threshold"""
 
 def evaluate_lstm_weighted(model, test_loader, device, percentile_threshold=90):
     model.eval()
@@ -449,29 +845,239 @@ def evaluate_lstm_weighted(model, test_loader, device, percentile_threshold=90):
 
     threshold = np.percentile(anomaly_scores, percentile_threshold)
     anomaly_indices = [i for i, score in enumerate(anomaly_scores) if score > threshold]
-    return anomaly_indices
+    return anomaly_indices, anomaly_scores
 
-anomalies = evaluate_lstm_weighted(model, test_loader_combined, device, 90)
+print("\n--- Evaluating Final Model ---")
+final_f1, anomaly_scores = evaluate_for_optuna(
+    model, test_loader_final, device, 
+    final_percentile_threshold, true_anomalies, sequence_length
+)
 
-def calculate_f1_score(anomaly_indices, true_anomalies):
+threshold_value = np.percentile(anomaly_scores, final_percentile_threshold)
+anomalies = [i for i, score in enumerate(anomaly_scores) if score > threshold_value]
+
+print("\n--- Anomaly Score Diagnostics ---")
+print(f"Anomaly scores - Min: {np.min(anomaly_scores):.4f}, Max: {np.max(anomaly_scores):.4f}")
+print(f"Anomaly scores - Mean: {np.mean(anomaly_scores):.4f}, Std: {np.std(anomaly_scores):.4f}")
+print(f"Threshold percentile: {final_percentile_threshold}")
+print(f"Threshold value: {threshold_value:.4f}")
+print(f"Number of detected anomalies: {len(anomalies)}")
+print(f"True anomaly rate: {np.sum(true_anomalies) / len(true_anomalies) * 100:.2f}%")
+print(f"F1 Score: {final_f1:.4f}")
+
+def calculate_f1_score(anomaly_indices, true_anomalies, sequence_length):
+    """
+    Calculate F1 score.
+    
+    For windowed sequences, we need to align predictions with the original labels.
+    Each sequence at index i corresponds to the time window [i, i+sequence_length-1].
+    We assign the prediction to the last timestep of each window.
+    """
+    # Adjust true_anomalies to match the sequence indices
+    # After windowing, we have len(test_data) - sequence_length + 1 sequences
+    # Each sequence i corresponds to original positions [i, i+sequence_length-1]
+    # We use the label of the last position (i + sequence_length - 1)
+    adjusted_true_anomalies = true_anomalies[sequence_length-1:]
+    
     # Create a binary array representing predicted anomalies
-    predicted_anomalies = np.zeros_like(true_anomalies)
+    predicted_anomalies = np.zeros(len(adjusted_true_anomalies), dtype=int)
     for index in anomaly_indices:
         if index < len(predicted_anomalies):  # Check index bounds
-          predicted_anomalies[index] = 1
+            predicted_anomalies[index] = 1
 
     # Calculate the F1 score
-    f1 = f1_score(true_anomalies, predicted_anomalies)
-    return f1, predicted_anomalies
+    f1 = f1_score(adjusted_true_anomalies, predicted_anomalies)
+    return f1, predicted_anomalies, adjusted_true_anomalies
 
-f1, predicted_anomalies = calculate_f1_score(anomalies, true_anomalies)
-print(f"F1 Score: {f1}")
+f1, predicted_anomalies, adjusted_true_anomalies = calculate_f1_score(
+    anomalies, true_anomalies, sequence_length
+)
+print(f"\nF1 Score (with threshold percentile {final_percentile_threshold}): {f1}")
 
-auc_roc = roc_auc_score(true_anomalies, predicted_anomalies)
-print(f"AUC-ROC Score: {auc_roc}")
+# Calculate AUC-ROC if we have both classes
+unique_true = np.unique(adjusted_true_anomalies)
+if len(unique_true) > 1:
+    auc_roc = roc_auc_score(adjusted_true_anomalies, predicted_anomalies)
+    print(f"AUC-ROC Score: {auc_roc}")
+    
+    auc_pr = average_precision_score(adjusted_true_anomalies, predicted_anomalies)
+    print(f"AUCPR Score: {auc_pr}")
+else:
+    print("Warning: Only one class in true labels, cannot compute AUC-ROC or AUCPR")
 
-auc_pr = average_precision_score(true_anomalies, predicted_anomalies)
-print(f"AUCPR Score: {auc_pr}")
+print("\nClassification Report:")
+print(classification_report(adjusted_true_anomalies, predicted_anomalies, zero_division=0))
+print("Confusion Matrix:")
+print(confusion_matrix(adjusted_true_anomalies, predicted_anomalies))
 
-print(classification_report(true_anomalies, predicted_anomalies))
-print(confusion_matrix(true_anomalies, predicted_anomalies))
+"""## Optuna Visualization Functions
+
+Visualize the hyperparameter optimization results.
+"""
+
+def visualize_optuna_study(study, save_path=None):
+    """
+    Generate visualizations for Optuna study results.
+    
+    Args:
+        study: Optuna study object
+        save_path: Optional path prefix to save figures
+    """
+    import optuna.visualization as vis
+    
+    # Create figure for optimization history
+    fig1, ax1 = plt.subplots(figsize=(10, 6))
+    trial_values = [t.value for t in study.trials if t.value is not None]
+    trial_numbers = [t.number for t in study.trials if t.value is not None]
+    
+    ax1.plot(trial_numbers, trial_values, 'bo-', alpha=0.6, label='Trial F1 Score')
+    
+    # Add best value line
+    best_values = []
+    current_best = 0
+    for val in trial_values:
+        if val > current_best:
+            current_best = val
+        best_values.append(current_best)
+    ax1.plot(trial_numbers, best_values, 'r-', linewidth=2, label='Best F1 Score')
+    
+    ax1.set_xlabel('Trial Number')
+    ax1.set_ylabel('F1 Score')
+    ax1.set_title('Optuna Optimization History')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    if save_path:
+        plt.savefig(f'{save_path}_optimization_history.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    
+    # Create figure for parameter importance (focusing on encoder weights)
+    fig2, ax2 = plt.subplots(figsize=(12, 6))
+    
+    # Extract parameter values from completed trials
+    completed_trials = [t for t in study.trials if t.value is not None]
+    
+    if len(completed_trials) > 0:
+        top_weights = [t.params.get('top_weight', None) for t in completed_trials]
+        f1_scores = [t.value for t in completed_trials]
+        
+        # Filter out None values
+        valid_data = [(tw, f1) for tw, f1 in zip(top_weights, f1_scores) if tw is not None]
+        
+        if valid_data:
+            top_weights, f1_scores = zip(*valid_data)
+            
+            scatter = ax2.scatter(top_weights, f1_scores, c=range(len(top_weights)), 
+                                  cmap='viridis', alpha=0.7, s=50)
+            
+            # Highlight best trial
+            best_idx = np.argmax(f1_scores)
+            ax2.scatter([top_weights[best_idx]], [f1_scores[best_idx]], 
+                       c='red', s=200, marker='*', edgecolors='black', 
+                       linewidths=2, label=f'Best (top_weight={top_weights[best_idx]:.3f})')
+            
+            ax2.set_xlabel('Top Encoder Weight')
+            ax2.set_ylabel('F1 Score')
+            ax2.set_title('Encoder Weight vs Model Performance')
+            ax2.legend()
+            ax2.grid(True, alpha=0.3)
+            
+            plt.colorbar(scatter, ax=ax2, label='Trial Number')
+    
+    if save_path:
+        plt.savefig(f'{save_path}_weight_analysis.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    
+    # Parameter distribution plot
+    fig3, axes = plt.subplots(2, 3, figsize=(15, 10))
+    axes = axes.flatten()
+    
+    param_names = ['top_weight', 'hidden_dim', 'latent_dim', 'learning_rate', 
+                   'batch_size', 'percentile_threshold']
+    
+    for idx, param_name in enumerate(param_names):
+        if idx < len(axes):
+            param_values = [t.params.get(param_name, None) for t in completed_trials]
+            trial_f1s = [t.value for t in completed_trials]
+            
+            valid_data = [(p, f1) for p, f1 in zip(param_values, trial_f1s) if p is not None]
+            
+            if valid_data:
+                param_vals, f1_vals = zip(*valid_data)
+                axes[idx].scatter(param_vals, f1_vals, alpha=0.6)
+                axes[idx].set_xlabel(param_name)
+                axes[idx].set_ylabel('F1 Score')
+                axes[idx].set_title(f'{param_name} vs F1 Score')
+                axes[idx].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(f'{save_path}_parameter_analysis.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+
+def print_optuna_summary(study):
+    """
+    Print a detailed summary of the Optuna study results.
+    """
+    print("\n" + "=" * 70)
+    print("OPTUNA HYPERPARAMETER OPTIMIZATION SUMMARY")
+    print("=" * 70)
+    
+    print(f"\nDataset: SMD")
+    print(f"Total trials: {len(study.trials)}")
+    
+    completed = [t for t in study.trials if t.state == TrialState.COMPLETE]
+    pruned = [t for t in study.trials if t.state == TrialState.PRUNED]
+    
+    print(f"Completed trials: {len(completed)}")
+    print(f"Pruned trials: {len(pruned)}")
+    
+    if completed:
+        f1_scores = [t.value for t in completed]
+        print(f"\nF1 Score Statistics:")
+        print(f"  Best:   {max(f1_scores):.4f}")
+        print(f"  Mean:   {np.mean(f1_scores):.4f}")
+        print(f"  Std:    {np.std(f1_scores):.4f}")
+        print(f"  Median: {np.median(f1_scores):.4f}")
+        
+        print(f"\nBest Hyperparameters:")
+        for key, value in study.best_params.items():
+            if isinstance(value, float):
+                print(f"  {key}: {value:.6f}")
+            else:
+                print(f"  {key}: {value}")
+        
+        # Analyze encoder weight importance
+        top_weights = [t.params.get('top_weight', 0.5) for t in completed]
+        weight_corr = np.corrcoef(top_weights, f1_scores)[0, 1]
+        print(f"\nEncoder Weight Analysis:")
+        print(f"  Correlation with F1 Score: {weight_corr:.4f}")
+        print(f"  Optimal top_weight: {study.best_params.get('top_weight', 'N/A')}")
+        print(f"  Optimal remaining_weight: {1 - study.best_params.get('top_weight', 0.5):.4f}")
+    
+    print("=" * 70)
+
+
+# Visualize Optuna results if optimization was run
+if USE_OPTUNA and 'study' in dir():
+    print_optuna_summary(study)
+    visualize_optuna_study(study, save_path=f'optuna_SMD')
+
+
+"""## Final Model Performance Summary"""
+print("\n" + "=" * 70)
+print("FINAL MODEL PERFORMANCE SUMMARY")
+print("=" * 70)
+print(f"\nDataset: SMD")
+print(f"\nOptimized Hyperparameters:")
+print(f"  top_weight: {final_top_weight:.4f}")
+print(f"  remaining_weight: {final_remaining_weight:.4f}")
+print(f"  hidden_dim: {final_hidden_dim}")
+print(f"  latent_dim: {final_latent_dim}")
+print(f"  num_layers: {final_num_layers}")
+print(f"  learning_rate: {final_learning_rate:.6f}")
+print(f"  batch_size: {final_batch_size}")
+print(f"  percentile_threshold: {final_percentile_threshold:.2f}")
+print(f"\nPerformance Metrics:")
+print(f"  Point-wise F1 Score: {f1:.4f}")
