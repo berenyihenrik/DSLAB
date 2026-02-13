@@ -7,6 +7,7 @@ model training, hyperparameter optimization, and evaluation.
 Refactored to work with SMD (Server Machine Dataset) for anomaly detection.
 """
 
+import os
 import numpy as np
 import torch
 from torch.optim import Adam
@@ -18,7 +19,8 @@ from sklearn.model_selection import train_test_split
 from config import (
     SMD_DRIVE, MACHINE,
     SEQUENCE_LENGTH, INPUT_DIM, HIDDEN_DIM, LATENT_DIM, NUM_LAYERS,
-    BATCH_SIZE, NUM_EPOCHS, USE_OPTUNA, N_OPTUNA_TRIALS, DEFAULT_PARAMS, DEVICE
+    BATCH_SIZE, NUM_EPOCHS, USE_OPTUNA, N_OPTUNA_TRIALS, DEFAULT_PARAMS, DEVICE,
+    CUDNN_BENCHMARK, USE_AMP, USE_TORCH_COMPILE, DATALOADER_WORKERS, PIN_MEMORY
 )
 from data_loader import (
     load_smd_data, get_available_machines, preprocess_data,
@@ -41,6 +43,8 @@ from feature_selection import perform_feature_selection, split_features_by_indic
 
 def main():
     """Main execution function for SMD dataset."""
+    if torch.cuda.is_available() and CUDNN_BENCHMARK:
+        torch.backends.cudnn.benchmark = True
     
     # Print available machines
     print("Available SMD machines:")
@@ -65,11 +69,17 @@ def main():
     
     # Initial data loaders (for reference)
     train_data, val_data = train_test_split(sequences, test_size=0.3, random_state=42)
-    
+
     batch_size = BATCH_SIZE
-    train_loader = DataLoader(dataset=train_data, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(dataset=val_data, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(dataset=test_sequences, batch_size=batch_size, shuffle=False)
+    num_workers = min(DATALOADER_WORKERS, max(0, (os.cpu_count() or 2) // 2))
+    loader_kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": torch.cuda.is_available() and PIN_MEMORY,
+        "persistent_workers": num_workers > 0,
+    }
+    train_loader = DataLoader(dataset=train_data, batch_size=batch_size, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(dataset=val_data, batch_size=batch_size, shuffle=False, **loader_kwargs)
+    test_loader = DataLoader(dataset=test_sequences, batch_size=batch_size, shuffle=False, **loader_kwargs)
     device = DEVICE
     print(f"Using device: {device}")
     
@@ -102,9 +112,9 @@ def main():
     )
     
     batch_size = 32
-    train_loader_combined = DataLoader(dataset=train_data_combined, batch_size=batch_size, shuffle=True)
-    val_loader_combined = DataLoader(dataset=val_data_combined, batch_size=batch_size, shuffle=False)
-    test_loader_combined = DataLoader(dataset=test_sequences_combined, batch_size=batch_size, shuffle=False)
+    train_loader_combined = DataLoader(dataset=train_data_combined, batch_size=batch_size, shuffle=True, **loader_kwargs)
+    val_loader_combined = DataLoader(dataset=val_data_combined, batch_size=batch_size, shuffle=False, **loader_kwargs)
+    test_loader_combined = DataLoader(dataset=test_sequences_combined, batch_size=batch_size, shuffle=False, **loader_kwargs)
     
     print(f"Top features dimension: {len(selected_feature_indices)}")
     print(f"Remaining features dimension: {len(remaining_feature_indices)}")
@@ -170,9 +180,9 @@ def main():
         sequences_combined_final, test_size=0.3, random_state=42
     )
     
-    train_loader_final = DataLoader(dataset=train_data_final, batch_size=final_batch_size, shuffle=True)
-    val_loader_final = DataLoader(dataset=val_data_final, batch_size=final_batch_size, shuffle=False)
-    test_loader_final = DataLoader(dataset=test_sequences_combined_final, batch_size=final_batch_size, shuffle=False)
+    train_loader_final = DataLoader(dataset=train_data_final, batch_size=final_batch_size, shuffle=True, **loader_kwargs)
+    val_loader_final = DataLoader(dataset=val_data_final, batch_size=final_batch_size, shuffle=False, **loader_kwargs)
+    test_loader_final = DataLoader(dataset=test_sequences_combined_final, batch_size=final_batch_size, shuffle=False, **loader_kwargs)
     
     # Create and train final model
     model = LSTMVAE_Stacked_Weighted(
@@ -187,6 +197,9 @@ def main():
         top_weight=final_top_weight,
         remaining_weight=final_remaining_weight
     ).to(device)
+
+    if USE_TORCH_COMPILE and hasattr(torch, "compile") and device.type == "cuda":
+        model = torch.compile(model)
     
     optimizer = Adam(model.parameters(), lr=final_learning_rate)
     scheduler = ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.1)
@@ -198,7 +211,7 @@ def main():
     train_losses, val_losses = train_model_weighted(
         model, train_loader_final, val_loader_final,
         optimizer, loss_function_weighted, scheduler,
-        num_epochs=NUM_EPOCHS, device=device
+        num_epochs=NUM_EPOCHS, device=device, use_amp=USE_AMP
     )
     
     # Save the model

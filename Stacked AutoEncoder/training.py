@@ -41,7 +41,8 @@ def loss_function_weighted(x_top, x_remaining, x_hat_top, x_hat_remaining, mean,
     return reproduction_loss + beta * KLD
 
 
-def train_model_weighted(model, train_loader, val_loader, optimizer, loss_fn, scheduler, num_epochs=10, device='cpu'):
+def train_model_weighted(model, train_loader, val_loader, optimizer, loss_fn, scheduler, num_epochs=10,
+                         device='cpu', use_amp=True):
     """
     Train the weighted LSTM VAE model.
     
@@ -60,6 +61,9 @@ def train_model_weighted(model, train_loader, val_loader, optimizer, loss_fn, sc
         val_losses: List of validation losses per epoch
     """
     torch.cuda.empty_cache()
+    device = torch.device(device) if isinstance(device, str) else device
+    use_amp = use_amp and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     train_losses = []
     val_losses = []
 
@@ -78,22 +82,28 @@ def train_model_weighted(model, train_loader, val_loader, optimizer, loss_fn, sc
         backward_time = 0.0
         
         for batch_top, batch_remaining in train_loader:
-            batch_top = torch.tensor(batch_top, dtype=torch.float32).to(device)
-            batch_remaining = torch.tensor(batch_remaining, dtype=torch.float32).to(device)
-            
-            optimizer.zero_grad()
+            batch_top = torch.as_tensor(batch_top, dtype=torch.float32).to(device, non_blocking=True)
+            batch_remaining = torch.as_tensor(batch_remaining, dtype=torch.float32).to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
 
             # Time forward pass
             t0 = time.time()
             
-            recon_top, recon_remaining, mean, logvar = model(batch_top, batch_remaining)
-            loss = loss_fn(batch_top, batch_remaining, recon_top, recon_remaining, mean, logvar, 
-                          model.top_weight, model.remaining_weight)
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                recon_top, recon_remaining, mean, logvar = model(batch_top, batch_remaining)
+                loss = loss_fn(batch_top, batch_remaining, recon_top, recon_remaining, mean, logvar,
+                              model.top_weight, model.remaining_weight)
             
             forward_time += time.time() - t0
             
-            loss.backward()
-            optimizer.step()
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
 
             backward_time += time.time() - t0
             
@@ -107,12 +117,13 @@ def train_model_weighted(model, train_loader, val_loader, optimizer, loss_fn, sc
         valid_loss = 0.0
         with torch.no_grad():
             for batch_top, batch_remaining in val_loader:
-                batch_top = torch.tensor(batch_top, dtype=torch.float32).to(device)
-                batch_remaining = torch.tensor(batch_remaining, dtype=torch.float32).to(device)
-                
-                recon_top, recon_remaining, mean, logvar = model(batch_top, batch_remaining)
-                loss = loss_fn(batch_top, batch_remaining, recon_top, recon_remaining, mean, logvar,
-                              model.top_weight, model.remaining_weight)
+                batch_top = torch.as_tensor(batch_top, dtype=torch.float32).to(device, non_blocking=True)
+                batch_remaining = torch.as_tensor(batch_remaining, dtype=torch.float32).to(device, non_blocking=True)
+
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    recon_top, recon_remaining, mean, logvar = model(batch_top, batch_remaining)
+                    loss = loss_fn(batch_top, batch_remaining, recon_top, recon_remaining, mean, logvar,
+                                  model.top_weight, model.remaining_weight)
                 valid_loss += loss.item()
 
         valid_loss /= len(val_loader)

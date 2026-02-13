@@ -49,20 +49,33 @@ LEARNING_RATE = 1e-3
 NUM_EPOCHS = 256
 EARLY_STOP_PATIENCE = 10
 
+# Performance toggles
+
+# Enables cuDNN auto-tuner to pick the fastest convolution/LSTM kernels.
+CUDNN_BENCHMARK = True
+# Enables automatic mixed precision during training.
+USE_AMP = False
+# Enables torch.compile for graph-level optimization.
+USE_TORCH_COMPILE = False
+# Number of DataLoader worker processes (0 = main process only).
+DATALOADER_WORKERS = 0
+# Pins CPU memory for faster host-to-device transfers.
+PIN_MEMORY = False
+
 # Optuna settings
-USE_OPTUNA = True
+USE_OPTUNA = False
 N_OPTUNA_TRIALS = 50
 
 # Default hyperparameters (used when not using Optuna)
-DEFAULT_PARAMS = {
-    'top_weight': 0.7,
+DEFAULT_PARAMS = { # For SMD
+    'top_weight': 0.533206,
     'hidden_dim': 128,
     'latent_dim': 32,
-    'num_layers': 1,
-    'learning_rate': 1e-3,
-    'batch_size': 32,
-    'percentile_threshold': 90,
-    'kl_weight': 0.1
+    'num_layers': 2,
+    'learning_rate': 0.000018,
+    'batch_size': 512,
+    'percentile_threshold': 85,
+    'kl_weight': 0.427487
 }
 
 # Device configuration
