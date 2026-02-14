@@ -201,21 +201,21 @@ def create_sequences(data, sequence_length):
     return sequences
 
 
-def create_combined_sequences(data_top, data_remaining, sequence_length):
-    """
-    Create combined sequences for both feature groups.
+def create_grouped_sequences(data_groups, sequence_length):
+    """Create sequences from per-group time series data.
     
     Args:
-        data_top: numpy array for top features
-        data_remaining: numpy array for remaining features
-        sequence_length: Length of each sequence
+        data_groups: list of numpy arrays, one per encoder group.
+                     Each array has shape (timesteps, group_features).
+        sequence_length: Length of each sequence window.
     
     Returns:
-        List of tuples (sequence_top, sequence_remaining)
+        List of tuples, where each tuple contains one sequence array per group.
+        Each element is shape (sequence_length, group_features).
     """
-    sequences_top = []
-    sequences_remaining = []
-    for i in range(data_top.shape[0] - sequence_length + 1):
-        sequences_top.append(data_top[i:i + sequence_length])
-        sequences_remaining.append(data_remaining[i:i + sequence_length])
-    return list(zip(sequences_top, sequences_remaining))
+    n_samples = data_groups[0].shape[0] - sequence_length + 1
+    sequences = []
+    for i in range(n_samples):
+        sample = tuple(dg[i:i + sequence_length] for dg in data_groups)
+        sequences.append(sample)
+    return sequences

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Training functions for LSTM VAE with stacked weighted encoders."""
+"""Training functions for LSTM VAE with grouped encoders."""
 
 import copy
 import time
@@ -7,54 +7,44 @@ import torch
 import torch.nn as nn
 
 
-def loss_function_weighted(x_top, x_remaining, x_hat_top, x_hat_remaining, mean, log_var, top_weight=0.7, remaining_weight=0.3):
+def loss_function_grouped(x_groups, x_recon, mean, log_var, group_weights, group_positions, kl_weight=0.1):
     """
-    Compute weighted loss for the stacked VAE.
+    Compute group-weighted reconstruction loss + KL divergence.
     
     Args:
-        x_top: Original top features
-        x_remaining: Original remaining features
-        x_hat_top: Reconstructed top features
-        x_hat_remaining: Reconstructed remaining features
-        mean: Latent mean
-        log_var: Latent log variance
-        top_weight: Weight for top features reconstruction loss
-        remaining_weight: Weight for remaining features reconstruction loss
-    
-    Returns:
-        Total loss (reconstruction + KLD)
+        x_groups: list of tensors, one per group (batch, seq_len, group_size)
+        x_recon: reconstructed output (batch, seq_len, n_total_features)
+        mean: latent mean
+        log_var: latent log variance
+        group_weights: tensor of normalized weights per group
+        group_positions: list of lists, positions in x_recon for each group
+        kl_weight: beta for KL term
     """
-    # Ensure shapes match - reshape reconstructions if needed
-    if x_hat_top.shape != x_top.shape:
-        x_hat_top = x_hat_top.view_as(x_top)
-    if x_hat_remaining.shape != x_remaining.shape:
-        x_hat_remaining = x_hat_remaining.view_as(x_remaining)
-    
-    reproduction_loss_top = nn.functional.mse_loss(x_hat_top, x_top, reduction='mean')
-    reproduction_loss_remaining = nn.functional.mse_loss(x_hat_remaining, x_remaining, reduction='mean')
-    
-    reproduction_loss = top_weight * reproduction_loss_top + remaining_weight * reproduction_loss_remaining
-    
+    recon_loss = 0.0
+    for i, (x_g, positions) in enumerate(zip(x_groups, group_positions)):
+        x_recon_g = x_recon[:, :, positions]
+        group_loss = nn.functional.mse_loss(x_recon_g, x_g, reduction='mean')
+        recon_loss = recon_loss + group_weights[i] * group_loss
+
     KLD = -0.5 * torch.mean(1 + log_var - mean.pow(2) - log_var.exp())
-    beta = 0.1
-    
-    return reproduction_loss + beta * KLD
+    return recon_loss + kl_weight * KLD
 
 
-def train_model_weighted(model, train_loader, val_loader, optimizer, loss_fn, scheduler, num_epochs=10,
-                         device='cpu', use_amp=True):
+def train_model_grouped(model, train_loader, val_loader, optimizer, loss_fn, scheduler, num_epochs=10,
+                        device='cpu', use_amp=True):
     """
-    Train the weighted LSTM VAE model.
+    Train the grouped LSTM VAE model.
     
     Args:
-        model: LSTMVAE_Stacked_Weighted model
-        train_loader: Training data loader
+        model: LSTMVAE_Grouped model
+        train_loader: Training data loader (yields tuples of tensors, one per group)
         val_loader: Validation data loader
         optimizer: Optimizer
         loss_fn: Loss function
         scheduler: Learning rate scheduler
         num_epochs: Number of training epochs
         device: Device to train on
+        use_amp: Whether to use automatic mixed precision
     
     Returns:
         train_losses: List of training losses per epoch
@@ -80,23 +70,22 @@ def train_model_weighted(model, train_loader, val_loader, optimizer, loss_fn, sc
         # Profiling timers
         forward_time = 0.0
         backward_time = 0.0
-        
-        for batch_top, batch_remaining in train_loader:
-            batch_top = torch.as_tensor(batch_top, dtype=torch.float32).to(device, non_blocking=True)
-            batch_remaining = torch.as_tensor(batch_remaining, dtype=torch.float32).to(device, non_blocking=True)
+
+        for batch in train_loader:
+            x_groups = [torch.as_tensor(g, dtype=torch.float32).to(device, non_blocking=True) for g in batch]
 
             optimizer.zero_grad(set_to_none=True)
 
             # Time forward pass
             t0 = time.time()
-            
+
             with torch.cuda.amp.autocast(enabled=use_amp):
-                recon_top, recon_remaining, mean, logvar = model(batch_top, batch_remaining)
-                loss = loss_fn(batch_top, batch_remaining, recon_top, recon_remaining, mean, logvar,
-                              model.top_weight, model.remaining_weight)
-            
+                x_recon, mean, logvar = model(x_groups)
+                loss = loss_fn(x_groups, x_recon, mean, logvar,
+                               model.group_weights, model.group_positions)
+
             forward_time += time.time() - t0
-            
+
             if use_amp:
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -106,7 +95,7 @@ def train_model_weighted(model, train_loader, val_loader, optimizer, loss_fn, sc
                 optimizer.step()
 
             backward_time += time.time() - t0
-            
+
             train_loss += loss.item()
 
         train_loss /= len(train_loader)
@@ -116,14 +105,13 @@ def train_model_weighted(model, train_loader, val_loader, optimizer, loss_fn, sc
         model.eval()
         valid_loss = 0.0
         with torch.no_grad():
-            for batch_top, batch_remaining in val_loader:
-                batch_top = torch.as_tensor(batch_top, dtype=torch.float32).to(device, non_blocking=True)
-                batch_remaining = torch.as_tensor(batch_remaining, dtype=torch.float32).to(device, non_blocking=True)
+            for batch in val_loader:
+                x_groups = [torch.as_tensor(g, dtype=torch.float32).to(device, non_blocking=True) for g in batch]
 
                 with torch.cuda.amp.autocast(enabled=use_amp):
-                    recon_top, recon_remaining, mean, logvar = model(batch_top, batch_remaining)
-                    loss = loss_fn(batch_top, batch_remaining, recon_top, recon_remaining, mean, logvar,
-                                  model.top_weight, model.remaining_weight)
+                    x_recon, mean, logvar = model(x_groups)
+                    loss = loss_fn(x_groups, x_recon, mean, logvar,
+                                   model.group_weights, model.group_positions)
                 valid_loss += loss.item()
 
         valid_loss /= len(val_loader)
