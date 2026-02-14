@@ -5,16 +5,16 @@ import torch
 import numpy as np
 from sklearn.metrics import f1_score, classification_report, confusion_matrix, roc_auc_score, average_precision_score
 
-from training import loss_function_weighted
+from training import loss_function_grouped
 
 
-def evaluate_lstm_weighted(model, test_loader, device, percentile_threshold=90):
+def evaluate_lstm_grouped(model, test_loader, device, percentile_threshold=90):
     """
-    Evaluate the LSTM VAE model and return anomaly indices.
+    Evaluate the grouped LSTM VAE model and return anomaly indices.
     
     Args:
-        model: Trained model
-        test_loader: Test data loader
+        model: Trained LSTMVAE_Grouped model
+        test_loader: Test data loader (yields tuples of N tensors, one per group)
         device: Device
         percentile_threshold: Percentile threshold for anomaly detection
     
@@ -26,24 +26,28 @@ def evaluate_lstm_weighted(model, test_loader, device, percentile_threshold=90):
     anomaly_scores = []
 
     with torch.no_grad():
-        for batch_top, batch_remaining in test_loader:
-            batch_top = torch.tensor(batch_top, dtype=torch.float32).to(device)
-            batch_remaining = torch.tensor(batch_remaining, dtype=torch.float32).to(device)
+        for batch in test_loader:
+            x_groups = [g.to(device) for g in batch]
+            batch_size = x_groups[0].shape[0]
 
-            batch_scores = []
-            for i in range(batch_top.shape[0]):
-                sequence_top = batch_top[i, :, :].unsqueeze(0)
-                sequence_remaining = batch_remaining[i, :, :].unsqueeze(0)
-                
-                recon_top, recon_remaining, mean, logvar = model(sequence_top, sequence_remaining)
-                loss = loss_function_weighted(sequence_top, sequence_remaining, recon_top, recon_remaining, 
-                                             mean, logvar, model.top_weight, model.remaining_weight)
-                batch_scores.append(loss.item())
-            anomaly_scores.extend(batch_scores)
+            x_recon, mean, logvar = model(x_groups)
+
+            for i in range(batch_size):
+                sample_groups = [g[i:i+1] for g in x_groups]
+                sample_recon = x_recon[i:i+1]
+                sample_mean = mean[i:i+1]
+                sample_logvar = logvar[i:i+1]
+                loss = loss_function_grouped(sample_groups, sample_recon, sample_mean, sample_logvar,
+                                             model.group_weights, model.group_positions)
+                anomaly_scores.append(loss.item())
 
     threshold = np.percentile(anomaly_scores, percentile_threshold)
     anomaly_indices = [i for i, score in enumerate(anomaly_scores) if score > threshold]
     return anomaly_indices, anomaly_scores
+
+
+# Backward compatibility alias
+evaluate_lstm_weighted = evaluate_lstm_grouped
 
 
 def calculate_f1_score_smap_msl(anomaly_indices, true_anomalies, sequence_length):

@@ -63,12 +63,11 @@ DATALOADER_WORKERS = 0
 PIN_MEMORY = False
 
 # Optuna settings
-USE_OPTUNA = False
+USE_OPTUNA = True
 N_OPTUNA_TRIALS = 50
 
 # Default hyperparameters (used when not using Optuna)
 DEFAULT_PARAMS = { # For SMD
-    'top_weight': 0.533206,
     'hidden_dim': 128,
     'latent_dim': 32,
     'num_layers': 2,

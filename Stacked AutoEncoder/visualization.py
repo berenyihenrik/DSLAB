@@ -42,34 +42,34 @@ def visualize_optuna_study(study, save_path=None, dataset_name="MSL", identifier
         plt.savefig(f'{save_path}_optimization_history.png', dpi=150, bbox_inches='tight')
     plt.show()
     
-    # Create figure for parameter importance (focusing on encoder weights)
+    # Create figure for KL weight analysis
     fig2, ax2 = plt.subplots(figsize=(12, 6))
     
     # Extract parameter values from completed trials
     completed_trials = [t for t in study.trials if t.value is not None]
     
     if len(completed_trials) > 0:
-        top_weights = [t.params.get('top_weight', None) for t in completed_trials]
+        kl_weights = [t.params.get('kl_weight', None) for t in completed_trials]
         f1_scores = [t.value for t in completed_trials]
         
         # Filter out None values
-        valid_data = [(tw, f1) for tw, f1 in zip(top_weights, f1_scores) if tw is not None]
+        valid_data = [(kw, f1) for kw, f1 in zip(kl_weights, f1_scores) if kw is not None]
         
         if valid_data:
-            top_weights, f1_scores = zip(*valid_data)
+            kl_weights, f1_scores = zip(*valid_data)
             
-            scatter = ax2.scatter(top_weights, f1_scores, c=range(len(top_weights)), 
+            scatter = ax2.scatter(kl_weights, f1_scores, c=range(len(kl_weights)), 
                                   cmap='viridis', alpha=0.7, s=50)
             
             # Highlight best trial
             best_idx = np.argmax(f1_scores)
-            ax2.scatter([top_weights[best_idx]], [f1_scores[best_idx]], 
+            ax2.scatter([kl_weights[best_idx]], [f1_scores[best_idx]], 
                        c='red', s=200, marker='*', edgecolors='black', 
-                       linewidths=2, label=f'Best (top_weight={top_weights[best_idx]:.3f})')
+                       linewidths=2, label=f'Best (kl_weight={kl_weights[best_idx]:.3f})')
             
-            ax2.set_xlabel('Top Encoder Weight')
+            ax2.set_xlabel('KL Weight')
             ax2.set_ylabel('F1 Score')
-            ax2.set_title(f'Encoder Weight vs Model Performance - {dataset_name} {identifier}')
+            ax2.set_title(f'KL Weight vs Model Performance - {dataset_name} {identifier}')
             ax2.legend()
             ax2.grid(True, alpha=0.3)
             
@@ -83,7 +83,7 @@ def visualize_optuna_study(study, save_path=None, dataset_name="MSL", identifier
     fig3, axes = plt.subplots(2, 3, figsize=(15, 10))
     axes = axes.flatten()
     
-    param_names = ['top_weight', 'hidden_dim', 'latent_dim', 'learning_rate', 
+    param_names = ['kl_weight', 'hidden_dim', 'latent_dim', 'learning_rate', 
                    'batch_size', 'percentile_threshold']
     
     for idx, param_name in enumerate(param_names):
@@ -145,13 +145,12 @@ def print_optuna_summary(study, dataset_name="MSL", identifier="M-1"):
             else:
                 print(f"  {key}: {value}")
         
-        # Analyze encoder weight importance
-        top_weights = [t.params.get('top_weight', 0.5) for t in completed]
-        weight_corr = np.corrcoef(top_weights, f1_scores)[0, 1]
-        print(f"\nEncoder Weight Analysis:")
+        # Analyze KL weight importance
+        kl_weights = [t.params.get('kl_weight', 0.1) for t in completed]
+        weight_corr = np.corrcoef(kl_weights, f1_scores)[0, 1]
+        print(f"\nKL Weight Analysis:")
         print(f"  Correlation with F1 Score: {weight_corr:.4f}")
-        print(f"  Optimal top_weight: {study.best_params.get('top_weight', 'N/A')}")
-        print(f"  Optimal remaining_weight: {1 - study.best_params.get('top_weight', 0.5):.4f}")
+        print(f"  Optimal kl_weight: {study.best_params.get('kl_weight', 'N/A')}")
     
     print("=" * 70)
 
@@ -172,14 +171,11 @@ def print_final_summary(dataset_name, identifier, best_params, f1, pa_results=No
     print("=" * 70)
     print(f"\nDataset: {dataset_name}, Identifier: {identifier}")
     print(f"\nOptimized Hyperparameters:")
-    print(f"  top_weight: {best_params['top_weight']:.4f}")
-    print(f"  remaining_weight: {1.0 - best_params['top_weight']:.4f}")
-    print(f"  hidden_dim: {best_params['hidden_dim']}")
-    print(f"  latent_dim: {best_params['latent_dim']}")
-    print(f"  num_layers: {best_params['num_layers']}")
-    print(f"  learning_rate: {best_params['learning_rate']:.6f}")
-    print(f"  batch_size: {best_params['batch_size']}")
-    print(f"  percentile_threshold: {best_params['percentile_threshold']}")
+    for key, value in best_params.items():
+        if isinstance(value, float):
+            print(f"  {key}: {value:.6f}")
+        else:
+            print(f"  {key}: {value}")
     print(f"\nPerformance Metrics:")
     print(f"  Point-wise F1 Score: {f1:.4f}")
     if pa_results is not None:

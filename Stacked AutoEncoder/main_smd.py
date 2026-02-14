@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""LSTM VAE stacked for SMD (Server Machine Dataset).
+"""LSTM VAE grouped for SMD (Server Machine Dataset).
 
 Main entry point that orchestrates data loading, feature selection,
 model training, hyperparameter optimization, and evaluation.
@@ -24,10 +24,10 @@ from config import (
 )
 from data_loader import (
     load_smd_data, get_available_machines, preprocess_data,
-    create_sequences, create_combined_sequences
+    create_sequences, create_grouped_sequences
 )
-from models import LSTMVAE_Stacked_Weighted
-from training import loss_function_weighted, train_model_weighted, save_model
+from models import LSTMVAE_Grouped
+from training import loss_function_grouped, train_model_grouped, save_model
 from optuna_tuning import (
     create_optuna_objective, run_optuna_study, evaluate_for_optuna
 )
@@ -38,7 +38,7 @@ from evaluation import (
 from visualization import (
     visualize_optuna_study, print_optuna_summary, print_final_summary
 )
-from feature_selection import perform_feature_selection, split_features_by_indices
+from feature_selection import perform_feature_selection, split_features_by_groups
 
 
 def main():
@@ -62,78 +62,43 @@ def main():
     metric_tensor = preprocess_data(metric_tensor)
     metric_test_tensor = preprocess_data(metric_test_tensor)
     
-    # Create initial sequences for feature selection
     sequence_length = SEQUENCE_LENGTH
-    sequences = create_sequences(metric_tensor, sequence_length)
-    test_sequences = create_sequences(metric_test_tensor, sequence_length)
+    device = DEVICE
+    print(f"Using device: {device}")
+    print(f"Number of features: {metric_tensor.shape[1]}")
     
-    # Initial data loaders (for reference)
-    train_data, val_data = train_test_split(sequences, test_size=0.3, random_state=42)
-
-    batch_size = BATCH_SIZE
+    # Perform feature selection (grouped, on training data only)
+    encoder_groups, dropped_feature_indices = perform_feature_selection(
+        metric_tensor, metric_tensor.shape[1], sequence_length, device
+    )
+    
+    print(f"\nEncoder groups: {len(encoder_groups)}")
+    for i, group in enumerate(encoder_groups):
+        print(f"  Group {i}: {len(group)} features")
+    if dropped_feature_indices:
+        print(f"  Dropped features: {len(dropped_feature_indices)}")
+    
+    # Split features by groups
+    data_groups_train = split_features_by_groups(metric_tensor, encoder_groups)
+    data_groups_test = split_features_by_groups(metric_test_tensor, encoder_groups)
+    
+    # Create grouped sequences
+    sequences_grouped = create_grouped_sequences(data_groups_train, sequence_length)
+    test_sequences_grouped = create_grouped_sequences(data_groups_test, sequence_length)
+    
+    # DataLoader kwargs
     num_workers = min(DATALOADER_WORKERS, max(0, (os.cpu_count() or 2) // 2))
     loader_kwargs = {
         "num_workers": num_workers,
         "pin_memory": torch.cuda.is_available() and PIN_MEMORY,
         "persistent_workers": num_workers > 0,
     }
-    train_loader = DataLoader(dataset=train_data, batch_size=batch_size, shuffle=True, **loader_kwargs)
-    val_loader = DataLoader(dataset=val_data, batch_size=batch_size, shuffle=False, **loader_kwargs)
-    test_loader = DataLoader(dataset=test_sequences, batch_size=batch_size, shuffle=False, **loader_kwargs)
-    device = DEVICE
-    print(f"Using device: {device}")
-    
-    print(f"Sequence shape: {sequences[0].shape}")
-    print(f"Number of features: {metric_tensor.shape[1]}")
-    
-    # Perform feature selection (two-stage unsupervised, on training data only)
-    selected_feature_indices, remaining_feature_indices = perform_feature_selection(
-        metric_tensor, metric_tensor.shape[1], sequence_length, device
-    )
-    
-    # Split features into top and remaining groups
-    metric_tensor_top, metric_tensor_remaining = split_features_by_indices(
-        metric_tensor, selected_feature_indices, remaining_feature_indices
-    )
-    metric_test_tensor_top, metric_test_tensor_remaining = split_features_by_indices(
-        metric_test_tensor, selected_feature_indices, remaining_feature_indices
-    )
-    
-    # Create combined sequences
-    sequences_combined = create_combined_sequences(
-        metric_tensor_top, metric_tensor_remaining, sequence_length
-    )
-    test_sequences_combined = create_combined_sequences(
-        metric_test_tensor_top, metric_test_tensor_remaining, sequence_length
-    )
-    
-    train_data_combined, val_data_combined = train_test_split(
-        sequences_combined, test_size=0.3, random_state=42
-    )
-    
-    batch_size = 32
-    train_loader_combined = DataLoader(dataset=train_data_combined, batch_size=batch_size, shuffle=True, **loader_kwargs)
-    val_loader_combined = DataLoader(dataset=val_data_combined, batch_size=batch_size, shuffle=False, **loader_kwargs)
-    test_loader_combined = DataLoader(dataset=test_sequences_combined, batch_size=batch_size, shuffle=False, **loader_kwargs)
-    
-    print(f"Top features dimension: {len(selected_feature_indices)}")
-    print(f"Remaining features dimension: {len(remaining_feature_indices)}")
-    
-    # Model parameters
-    num_top_sensors = len(selected_feature_indices)
-    num_remaining_sensors = len(remaining_feature_indices)
-    input_dim = INPUT_DIM
-    hidden_dim = HIDDEN_DIM
-    latent_dim = LATENT_DIM
-    num_layers = NUM_LAYERS
     
     # Optuna hyperparameter tuning or use defaults
     if USE_OPTUNA:
         # Create objective function with data context
         objective_fn = create_optuna_objective(
-            selected_feature_indices, remaining_feature_indices,
-            metric_tensor_top, metric_tensor_remaining,
-            metric_test_tensor_top, metric_test_tensor_remaining,
+            encoder_groups, data_groups_train, data_groups_test,
             true_anomalies, device
         )
         
@@ -159,8 +124,6 @@ def main():
         print(f"  {key}: {value}")
     
     # Extract final hyperparameters
-    final_top_weight = best_params['top_weight']
-    final_remaining_weight = 1.0 - final_top_weight
     final_hidden_dim = best_params['hidden_dim']
     final_latent_dim = best_params['latent_dim']
     final_num_layers = best_params['num_layers']
@@ -169,33 +132,25 @@ def main():
     final_percentile_threshold = best_params['percentile_threshold']
     
     # Create final data loaders with optimized batch size
-    sequences_combined_final = create_combined_sequences(
-        metric_tensor_top, metric_tensor_remaining, sequence_length
-    )
-    test_sequences_combined_final = create_combined_sequences(
-        metric_test_tensor_top, metric_test_tensor_remaining, sequence_length
-    )
+    sequences_grouped_final = create_grouped_sequences(data_groups_train, sequence_length)
+    test_sequences_grouped_final = create_grouped_sequences(data_groups_test, sequence_length)
     
     train_data_final, val_data_final = train_test_split(
-        sequences_combined_final, test_size=0.3, random_state=42
+        sequences_grouped_final, test_size=0.3, random_state=42
     )
     
     train_loader_final = DataLoader(dataset=train_data_final, batch_size=final_batch_size, shuffle=True, **loader_kwargs)
     val_loader_final = DataLoader(dataset=val_data_final, batch_size=final_batch_size, shuffle=False, **loader_kwargs)
-    test_loader_final = DataLoader(dataset=test_sequences_combined_final, batch_size=final_batch_size, shuffle=False, **loader_kwargs)
+    test_loader_final = DataLoader(dataset=test_sequences_grouped_final, batch_size=final_batch_size, shuffle=False, **loader_kwargs)
     
     # Create and train final model
-    model = LSTMVAE_Stacked_Weighted(
-        num_top_sensors=num_top_sensors,
-        num_remaining_sensors=num_remaining_sensors,
-        input_dim=input_dim,
+    model = LSTMVAE_Grouped(
+        encoder_groups=encoder_groups,
         hidden_dim=final_hidden_dim,
         latent_dim=final_latent_dim,
         sequence_length=sequence_length,
         num_layers=final_num_layers,
         device=device,
-        top_weight=final_top_weight,
-        remaining_weight=final_remaining_weight
     ).to(device)
 
     if USE_TORCH_COMPILE and hasattr(torch, "compile") and device.type == "cuda":
@@ -204,20 +159,18 @@ def main():
     optimizer = Adam(model.parameters(), lr=final_learning_rate)
     scheduler = ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.1)
     
-    print(f"\nTraining final model with optimized encoder weights:")
-    print(f"  top_weight: {final_top_weight:.4f}")
-    print(f"  remaining_weight: {final_remaining_weight:.4f}")
+    print(f"\nTraining final model with {len(encoder_groups)} encoder groups...")
     
-    train_losses, val_losses = train_model_weighted(
+    train_losses, val_losses = train_model_grouped(
         model, train_loader_final, val_loader_final,
-        optimizer, loss_function_weighted, scheduler,
+        optimizer, loss_function_grouped, scheduler,
         num_epochs=NUM_EPOCHS, device=device, use_amp=USE_AMP
     )
     
     # Save the model
     machine_name = MACHINE.replace('.txt', '')
-    model_name = f'vae_stacked_weighted_SMD_{machine_name}_optuna'
-    save_model(model, model_name, input_dim, final_latent_dim, final_hidden_dim)
+    model_name = f'vae_grouped_SMD_{machine_name}_optuna'
+    save_model(model, model_name, INPUT_DIM, final_latent_dim, final_hidden_dim)
     print(f"\nOptimized model saved as: {model_name}.pth")
     
     # Evaluate the model
