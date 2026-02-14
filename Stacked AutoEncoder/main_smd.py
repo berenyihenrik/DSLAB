@@ -86,9 +86,9 @@ def main():
     print(f"Sequence shape: {sequences[0].shape}")
     print(f"Number of features: {metric_tensor.shape[1]}")
     
-    # Perform feature selection
+    # Perform feature selection (unsupervised, on training data only)
     selected_feature_indices, remaining_feature_indices = perform_feature_selection(
-        test_sequences, true_anomalies, sequence_length, metric_tensor.shape[1]
+        metric_tensor, metric_tensor.shape[1]
     )
     
     # Split features into top and remaining groups

@@ -1,71 +1,42 @@
 # -*- coding: utf-8 -*-
-"""Feature selection functions using RandomForest for importance ranking."""
+"""Feature selection functions using unsupervised methods on training data only."""
 
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier
 
 
-def perform_feature_selection(test_sequences, true_anomalies, sequence_length, n_features):
+def perform_feature_selection(train_data, n_features):
     """
-    Perform feature selection using RandomForestClassifier.
+    Perform feature selection using unsupervised variance-based ranking
+    on training data only (no data leakage).
+    
+    Features are ranked by their variance on the training set. High-variance
+    features are more likely to carry useful signal for anomaly detection.
     
     Args:
-        test_sequences: List of test sequences
-        true_anomalies: Ground truth anomaly labels
-        sequence_length: Sequence length
+        train_data: Training data array of shape (timesteps, n_features)
         n_features: Number of features
     
     Returns:
         selected_feature_indices: Indices of top features
         remaining_feature_indices: Indices of remaining features
     """
-    # Adjust true_anomalies to match test_sequences length (due to windowing)
-    adjusted_true_anomalies = true_anomalies[sequence_length-1:]
+    # Compute per-feature variance on training data
+    feature_variances = np.var(train_data, axis=0)
     
-    # Flatten the test sequences for the RandomForestClassifier
-    n_samples_test, n_timesteps, n_features_actual = np.array(test_sequences).shape
-    X_test_flat = np.array(test_sequences).reshape(n_samples_test, n_timesteps * n_features_actual)
-    y_test_true = adjusted_true_anomalies[:n_samples_test]
+    # Rank features by variance (highest first)
+    ranked_features_indices = np.argsort(feature_variances)[::-1]
+    ranked_features_variance = feature_variances[ranked_features_indices]
     
-    print(f"Test sequences shape: {n_samples_test}, {n_timesteps}, {n_features_actual}")
-    print(f"Adjusted labels length: {len(y_test_true)}")
+    print("Feature Variances (training data):")
+    for i, index in enumerate(ranked_features_indices):
+        print(f"Feature {index}: {ranked_features_variance[i]:.6f}")
     
-    # Check if we have both classes for training RF
-    unique_classes = np.unique(y_test_true)
-    print(f"Unique classes in labels: {unique_classes}")
+    # Determine the number of top features to select
+    num_selected_features = min(25, max(1, n_features // 2))
     
-    if len(unique_classes) < 2:
-        print("Warning: Only one class present in labels. Using all features without RF selection.")
-        n_features_total = n_features
-        num_selected_features = min(25, n_features_total)
-        selected_feature_indices = np.arange(num_selected_features)
-        remaining_feature_indices = np.arange(num_selected_features, n_features_total)
-    else:
-        # Initialize and train the RandomForestClassifier
-        rf_model = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
-        rf_model.fit(X_test_flat, y_test_true)
-        
-        # Get feature importances
-        feature_importances = rf_model.feature_importances_
-        
-        # Map back to original features by averaging across timesteps
-        original_feature_importances = feature_importances.reshape(n_timesteps, n_features_actual).mean(axis=0)
-        
-        # Rank features by importance
-        ranked_features_indices = np.argsort(original_feature_importances)[::-1]
-        ranked_features_importance = original_feature_importances[ranked_features_indices]
-        
-        print("Feature Importances (averaged across timesteps):")
-        for i, index in enumerate(ranked_features_indices):
-            print(f"Feature {index}: {ranked_features_importance[i]:.4f}")
-        
-        # Determine the number of top features to select
-        n_features_total = n_features_actual
-        num_selected_features = min(25, max(1, n_features_total // 2))
-        
-        # Get the indices of the top N features
-        selected_feature_indices = ranked_features_indices[:num_selected_features]
-        remaining_feature_indices = ranked_features_indices[num_selected_features:]
+    # Get the indices of the top N features
+    selected_feature_indices = ranked_features_indices[:num_selected_features]
+    remaining_feature_indices = ranked_features_indices[num_selected_features:]
     
     print(f"\nSelected Top {len(selected_feature_indices)} Feature Indices: {selected_feature_indices}")
     print(f"Remaining {len(remaining_feature_indices)} Feature Indices: {remaining_feature_indices}")
