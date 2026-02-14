@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Model architectures for LSTM VAE with stacked weighted encoders."""
+"""Model architectures for LSTM VAE with grouped encoders."""
 
 import torch
 import torch.nn as nn
@@ -19,100 +19,90 @@ class LSTMEncoder(nn.Module):
 
 
 class SharedDecoder(nn.Module):
-    def __init__(self, input_features_dim, hidden_dim, output_features_dim_top, output_features_dim_remaining, sequence_length, num_layers=1):
+    def __init__(self, input_features_dim, hidden_dim, output_features_dim, sequence_length, num_layers=1):
         super(SharedDecoder, self).__init__()
         self.sequence_length = sequence_length
         self.latent_to_hidden = nn.Linear(input_features_dim, hidden_dim)
         self.lstm = nn.LSTM(hidden_dim, hidden_dim, num_layers=num_layers, batch_first=True)
-        
-        # Separate output layers for top and remaining features
-        self.output_layer_top = nn.Linear(hidden_dim, output_features_dim_top)
-        self.output_layer_remaining = nn.Linear(hidden_dim, output_features_dim_remaining)
+        self.output_layer = nn.Linear(hidden_dim, output_features_dim)
 
     def forward(self, z):
         hidden = self.latent_to_hidden(z).unsqueeze(1).repeat(1, self.sequence_length, 1)
         out, _ = self.lstm(hidden)
-        recon_top = self.output_layer_top(out)
-        recon_remaining = self.output_layer_remaining(out)
-        return recon_top, recon_remaining
+        return self.output_layer(out)
 
 
-class LSTMVAE_Stacked_Weighted(nn.Module):
-    def __init__(self, input_dim, hidden_dim, latent_dim, sequence_length, num_layers=1, 
-                 device='cpu', num_top_sensors=25, num_remaining_sensors=13, 
-                 top_weight=0.7, remaining_weight=0.3):
-        super(LSTMVAE_Stacked_Weighted, self).__init__()
-        self.input_dim = input_dim
-        self.num_top_sensors = num_top_sensors
-        self.num_remaining_sensors = num_remaining_sensors
+class LSTMVAE_Grouped(nn.Module):
+    def __init__(self, encoder_groups, hidden_dim, latent_dim, sequence_length,
+                 num_layers=1, device='cpu', group_weights=None):
+        """
+        Args:
+            encoder_groups: list[list[int]] — feature indices per encoder group
+            hidden_dim: LSTM hidden dimension
+            latent_dim: latent dimension per encoder
+            sequence_length: sequence window length
+            num_layers: LSTM layers
+            device: torch device
+            group_weights: optional list of floats (one per group) for loss weighting.
+                          If None, all groups weighted equally.
+        """
+        super(LSTMVAE_Grouped, self).__init__()
+        self.encoder_groups = encoder_groups
         self.sequence_length = sequence_length
         self.device = device
-        self.top_weight = top_weight
-        self.remaining_weight = remaining_weight
-        
-        # Separate encoders for top features
-        self.encoders_top = nn.ModuleList([
-            LSTMEncoder(input_dim, hidden_dim, latent_dim, num_layers).to(device) 
-            for _ in range(num_top_sensors)
+        self.n_total_features = sum(len(g) for g in encoder_groups)
+        n_groups = len(encoder_groups)
+
+        self.encoders = nn.ModuleList([
+            LSTMEncoder(len(group), hidden_dim, latent_dim, num_layers)
+            for group in encoder_groups
         ])
-        
-        # Single encoder for remaining features (processes all at once)
-        self.encoder_remaining = LSTMEncoder(num_remaining_sensors * input_dim, hidden_dim, latent_dim, num_layers).to(device)
-        
-        # Decoder input is concatenation of all latent representations
-        decoder_input_features = (num_top_sensors + 1) * latent_dim
-        decoder_output_features_top = input_dim * num_top_sensors
-        decoder_output_features_remaining = input_dim * num_remaining_sensors
-        
+
+        if group_weights is None:
+            weights = torch.ones(n_groups) / n_groups
+        else:
+            weights = torch.tensor(group_weights, dtype=torch.float32)
+            weights = weights / weights.sum()
+        self.register_buffer('group_weights', weights)
+
+        # Build group_positions: map each group's features to positions in sorted output
+        all_indices = sorted([idx for group in encoder_groups for idx in group])
+        index_to_pos = {idx: pos for pos, idx in enumerate(all_indices)}
+        self.group_positions = [
+            [index_to_pos[idx] for idx in group]
+            for group in encoder_groups
+        ]
+
+        decoder_input_dim = n_groups * latent_dim
         self.decoder = SharedDecoder(
-            decoder_input_features, 
-            hidden_dim, 
-            decoder_output_features_top,
-            decoder_output_features_remaining,
-            sequence_length, 
-            num_layers
-        ).to(device)
+            decoder_input_dim, hidden_dim, self.n_total_features, sequence_length, num_layers
+        )
 
     def reparameterize(self, mean, logvar):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mean + eps * std
 
-    def forward(self, x_top, x_remaining):
-        # x_top shape: (batch_size, sequence_length, num_top_sensors)
-        # x_remaining shape: (batch_size, sequence_length, num_remaining_sensors)
-        batch_size = x_top.shape[0]
-        
-        # Process top features with individual encoders
-        x_top_reshaped = x_top.view(batch_size, self.sequence_length, self.num_top_sensors, self.input_dim)
-        x_top_reshaped = x_top_reshaped.permute(0, 2, 1, 3)
-        x_top_flat = x_top_reshaped.reshape(batch_size * self.num_top_sensors, self.sequence_length, self.input_dim)
-        
-        means_top = []
-        logvars_top = []
-        for i, encoder in enumerate(self.encoders_top):
-            x_sensor = x_top_flat[i::self.num_top_sensors]
-            mean, logvar = encoder(x_sensor)
-            means_top.append(mean)
-            logvars_top.append(logvar)
-        
-        mean_top_stacked = torch.stack(means_top, dim=1)
-        logvar_top_stacked = torch.stack(logvars_top, dim=1)
-        z_top_stacked = self.reparameterize(mean_top_stacked, logvar_top_stacked)
-        
-        # Process remaining features with single encoder
-        x_remaining_flat = x_remaining.view(batch_size, self.sequence_length, -1)
-        mean_remaining, logvar_remaining = self.encoder_remaining(x_remaining_flat)
-        z_remaining = self.reparameterize(mean_remaining, logvar_remaining)
-        
-        # Combine latent representations
-        z_top_combined = z_top_stacked.reshape(batch_size, -1)
-        z_combined = torch.cat([z_top_combined, z_remaining], dim=1)
-        
-        mean_combined = torch.cat([mean_top_stacked.reshape(batch_size, -1), mean_remaining], dim=1)
-        logvar_combined = torch.cat([logvar_top_stacked.reshape(batch_size, -1), logvar_remaining], dim=1)
-        
-        # Decode
-        x_recon_top, x_recon_remaining = self.decoder(z_combined)
-        
-        return x_recon_top, x_recon_remaining, mean_combined, logvar_combined
+    def forward(self, x_groups):
+        """
+        Args:
+            x_groups: list of tensors, one per group.
+                      Each tensor shape: (batch, seq_len, group_size)
+        Returns:
+            x_recon: (batch, seq_len, n_total_features) in sorted feature order
+            mean: (batch, n_groups * latent_dim)
+            logvar: (batch, n_groups * latent_dim)
+        """
+        means = []
+        logvars = []
+        for encoder, x_g in zip(self.encoders, x_groups):
+            mean_i, logvar_i = encoder(x_g)
+            means.append(mean_i)
+            logvars.append(logvar_i)
+
+        mean = torch.cat(means, dim=1)
+        logvar = torch.cat(logvars, dim=1)
+        z = self.reparameterize(mean, logvar)
+        x_recon = self.decoder(z)
+
+        return x_recon, mean, logvar

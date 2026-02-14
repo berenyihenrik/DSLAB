@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Two-stage unsupervised feature selection on training data only.
+"""Four-stage unsupervised feature selection on training data only.
 
-Stage 1: Redundancy filtering via Spearman correlation + agglomerative clustering.
-Stage 2: AE masking importance — train a small LSTM-AE, then measure per-feature
-         reconstruction loss increase under block permutation on a held-out val split.
+Stage 0: Drop static features (std == 0 or IQR == 0).
+Stage 1: Redundancy clustering via Spearman correlation + agglomerative clustering.
+Stage 2: AE masking importance — train a small LSTM-AE on cluster representatives,
+         then measure per-feature reconstruction loss increase under block permutation.
+Stage 3: Group-aware encoder assignment — rank clusters by importance, assign
+         high-importance clusters to individual encoders and merge the rest.
 """
 
 import numpy as np
@@ -40,20 +43,53 @@ class _SmallLSTMAE(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Stage 1: Redundancy filtering
+# Stage 0: Drop static features
+# ---------------------------------------------------------------------------
+
+def _drop_static_features(train_data):
+    """Drop features with std == 0 or IQR == 0 (constant/near-constant).
+
+    Args:
+        train_data: array of shape (timesteps, n_features)
+
+    Returns:
+        kept_feature_indices: 1-D array of kept original feature indices
+        dropped_feature_indices: 1-D array of dropped original feature indices
+    """
+    n_features = train_data.shape[1]
+    stds = np.std(train_data, axis=0)
+    iqrs = np.subtract(*np.percentile(train_data, [75, 25], axis=0))
+
+    is_static = (stds == 0) | (iqrs == 0)
+    kept = np.where(~is_static)[0]
+    dropped = np.where(is_static)[0]
+
+    print("Stage 0 — Drop static features:")
+    print(f"  {n_features} total features, {len(dropped)} static (std==0 or IQR==0), {len(kept)} kept")
+    if len(dropped) > 0:
+        print(f"  Dropped feature indices: {dropped.tolist()}")
+
+    return kept, dropped
+
+
+# ---------------------------------------------------------------------------
+# Stage 1: Redundancy clustering
 # ---------------------------------------------------------------------------
 
 def _compute_redundancy_clusters(train_data, corr_threshold=0.9):
     """Cluster features by Spearman correlation and pick one representative
-    per cluster (highest IQR variance).
+    per cluster (highest IQR variance).  Preserves full cluster membership.
 
     Args:
         train_data: array of shape (timesteps, n_features)
         corr_threshold: |corr| above which features are merged
 
     Returns:
-        representative_indices: 1-D array of selected feature indices
-        cluster_labels: cluster id for every original feature (for logging)
+        representative_indices: 1-D array of selected feature column indices
+            (positions within *train_data*, not original feature space)
+        cluster_labels: cluster id for every column in train_data
+        cluster_members_dict: dict mapping cluster_id → list of column indices
+            (positions within *train_data*)
     """
     n_features = train_data.shape[1]
 
@@ -81,19 +117,25 @@ def _compute_redundancy_clusters(train_data, corr_threshold=0.9):
     # For each cluster, pick the feature with the highest IQR
     iqr_scores = np.subtract(*np.percentile(train_data, [75, 25], axis=0))
     representative_indices = []
+    cluster_members_dict = {}
     unique_clusters = np.unique(cluster_labels)
     for cid in unique_clusters:
         members = np.where(cluster_labels == cid)[0]
+        cluster_members_dict[cid] = members.tolist()
         best = members[np.argmax(iqr_scores[members])]
         representative_indices.append(best)
 
     representative_indices = np.sort(representative_indices)
 
-    print(f"Stage 1 — Redundancy filtering:")
+    print(f"\nStage 1 — Redundancy clustering:")
     print(f"  {n_features} features → {len(unique_clusters)} clusters (threshold |corr| > {corr_threshold})")
-    print(f"  Representative indices: {representative_indices}")
+    print(f"  Representative indices (local): {representative_indices.tolist()}")
+    for cid in unique_clusters:
+        members = cluster_members_dict[cid]
+        rep = members[np.argmax(iqr_scores[members])]
+        print(f"    Cluster {cid}: members {members}, representative {rep}")
 
-    return representative_indices, cluster_labels
+    return representative_indices, cluster_labels, cluster_members_dict
 
 
 # ---------------------------------------------------------------------------
@@ -123,8 +165,8 @@ def _compute_masking_importance(
     feature by reconstruction-loss increase under block permutation.
 
     Args:
-        train_data: array (timesteps, n_all_features)
-        representative_indices: feature indices to evaluate
+        train_data: array (timesteps, n_features) — only the kept features
+        representative_indices: feature column indices (into train_data) to evaluate
         sequence_length: window length for sequences
         device: torch device
         hidden_dim: hidden size for the small AE
@@ -212,11 +254,14 @@ def _compute_masking_importance(
 # Public API
 # ---------------------------------------------------------------------------
 
-def perform_feature_selection(train_data, n_features, sequence_length, device, corr_threshold=0.9):
-    """Two-stage unsupervised feature selection on training data only.
+def perform_feature_selection(train_data, n_features, sequence_length, device,
+                              corr_threshold=0.9, importance_percentile=50):
+    """Four-stage unsupervised feature selection on training data only.
 
-    Stage 1: Spearman correlation clustering → remove redundant features.
-    Stage 2: LSTM-AE masking importance → rank remaining features.
+    Stage 0: Drop static features (std == 0 or IQR == 0).
+    Stage 1: Spearman correlation clustering → group redundant features.
+    Stage 2: LSTM-AE masking importance → score cluster representatives.
+    Stage 3: Group-aware encoder assignment → build encoder groups.
 
     Args:
         train_data: Training array of shape (timesteps, n_features)
@@ -224,57 +269,119 @@ def perform_feature_selection(train_data, n_features, sequence_length, device, c
         sequence_length: Window length used for sequences
         device: torch device (for AE training)
         corr_threshold: |correlation| above which features are clustered together
+        importance_percentile: Percentile cutoff for importance scores; clusters
+            with representative importance >= this percentile get their own
+            encoder group.  Lower clusters are merged into a catch-all group.
 
     Returns:
-        selected_feature_indices: Indices of top features (into original feature space)
-        remaining_feature_indices: Indices of remaining features
+        encoder_groups: list[list[int]] — each inner list is original feature indices
+                        for one encoder. Ordered by importance (most important first).
+                        Last group is the catch-all "remaining" group (if non-empty).
+        dropped_feature_indices: list[int] — static features that were dropped
     """
-    # Stage 1: redundancy filtering
-    representative_indices, _ = _compute_redundancy_clusters(train_data, corr_threshold)
+    # Stage 0: drop static features
+    kept_indices, dropped_indices = _drop_static_features(train_data)
+    dropped_feature_indices = dropped_indices.tolist()
 
-    # Stage 2: masking importance on representatives
+    if len(kept_indices) == 0:
+        print("Warning: All features are static. No encoder groups created.")
+        return [], dropped_feature_indices
+
+    kept_data = train_data[:, kept_indices]
+
+    # Stage 1: redundancy clustering (on kept features only)
+    representative_local, cluster_labels, cluster_members_dict = \
+        _compute_redundancy_clusters(kept_data, corr_threshold)
+
+    # Stage 2: AE masking importance on representatives
     importance_scores = _compute_masking_importance(
-        train_data, representative_indices, sequence_length, device
+        kept_data, representative_local, sequence_length, device
     )
 
-    # Rank representatives by importance
-    ranked_order = np.argsort(importance_scores)[::-1]
-    ranked_original_indices = representative_indices[ranked_order]
+    # Build mapping: representative local index → importance score
+    rep_to_importance = {}
+    for i, rep_local in enumerate(representative_local):
+        rep_to_importance[rep_local] = importance_scores[i]
 
-    # Select top-K
-    num_selected = min(25, max(1, n_features // 2))
-    # Can't select more than we have representatives
-    num_selected = min(num_selected, len(ranked_original_indices))
+    # Map each cluster to its representative's importance score
+    iqr_scores = np.subtract(*np.percentile(kept_data, [75, 25], axis=0))
+    cluster_importance = {}
+    cluster_representative = {}
+    for cid, members in cluster_members_dict.items():
+        rep = members[np.argmax(iqr_scores[members])]
+        cluster_representative[cid] = rep
+        cluster_importance[cid] = rep_to_importance[rep]
 
-    selected_feature_indices = np.sort(ranked_original_indices[:num_selected])
-    remaining_feature_indices = np.sort(ranked_original_indices[num_selected:])
+    # Stage 3: group-aware encoder assignment
+    scores = np.array(list(cluster_importance.values()))
+    cids = list(cluster_importance.keys())
+    threshold = np.percentile(scores, importance_percentile)
 
-    # If all representatives were selected, no remaining — handle edge case
-    if len(remaining_feature_indices) == 0:
-        print("Warning: No remaining features after selection. Splitting selected in half.")
-        mid = len(selected_feature_indices) // 2
-        remaining_feature_indices = selected_feature_indices[mid:]
-        selected_feature_indices = selected_feature_indices[:mid]
+    high_clusters = []  # (cid, importance) pairs for clusters above threshold
+    low_clusters = []
+    for cid in cids:
+        if cluster_importance[cid] >= threshold:
+            high_clusters.append((cid, cluster_importance[cid]))
+        else:
+            low_clusters.append((cid, cluster_importance[cid]))
 
-    print(f"\nFinal selection:")
-    print(f"  Selected ({len(selected_feature_indices)}): {selected_feature_indices}")
-    print(f"  Remaining ({len(remaining_feature_indices)}): {remaining_feature_indices}")
+    # Sort high-importance clusters by descending importance
+    high_clusters.sort(key=lambda x: x[1], reverse=True)
 
-    return selected_feature_indices, remaining_feature_indices
+    encoder_groups = []
+    # Each high-importance cluster becomes its own encoder group (original indices)
+    for cid, imp in high_clusters:
+        local_members = cluster_members_dict[cid]
+        original_members = sorted(kept_indices[m] for m in local_members)
+        encoder_groups.append(original_members)
+
+    # Merge all low-importance clusters into one catch-all group
+    catch_all = []
+    for cid, imp in low_clusters:
+        local_members = cluster_members_dict[cid]
+        catch_all.extend(kept_indices[m] for m in local_members)
+    if catch_all:
+        encoder_groups.append(sorted(catch_all))
+
+    # --- Assertions ---
+    all_assigned = set()
+    for group in encoder_groups:
+        group_set = set(group)
+        assert len(group_set & all_assigned) == 0, \
+            f"Encoder groups are not disjoint! Overlap: {group_set & all_assigned}"
+        all_assigned |= group_set
+    assert all_assigned == set(kept_indices.tolist()), \
+        (f"Union of encoder groups != kept features.\n"
+         f"  Missing: {set(kept_indices.tolist()) - all_assigned}\n"
+         f"  Extra:   {all_assigned - set(kept_indices.tolist())}")
+
+    # --- Logging ---
+    n_high = len(high_clusters)
+    n_low = len(low_clusters)
+    has_catchall = len(catch_all) > 0
+
+    print(f"\nStage 3 — Group-aware encoder assignment:")
+    print(f"  Importance threshold (percentile {importance_percentile}): {threshold:.6f}")
+    print(f"  {n_high} high-importance cluster(s) → {n_high} individual encoder group(s)")
+    print(f"  {n_low} low-importance cluster(s) → {'1 catch-all group' if has_catchall else 'no catch-all group (empty)'}")
+    print(f"  Total encoder groups: {len(encoder_groups)}")
+    for i, group in enumerate(encoder_groups):
+        label = "catch-all" if (has_catchall and i == len(encoder_groups) - 1) else f"important #{i+1}"
+        print(f"    Group {i} ({label}): {len(group)} features → {group}")
+
+    print(f"\n  Dropped static features ({len(dropped_feature_indices)}): {dropped_feature_indices}")
+
+    return encoder_groups, dropped_feature_indices
 
 
-def split_features_by_indices(data, selected_indices, remaining_indices):
-    """Split data into top and remaining features based on indices.
+def split_features_by_groups(data, encoder_groups):
+    """Split data array into per-group arrays.
 
     Args:
         data: numpy array of shape (timesteps, features)
-        selected_indices: Indices of selected/top features
-        remaining_indices: Indices of remaining features
+        encoder_groups: list of lists of feature indices
 
     Returns:
-        data_top: Data with only top features
-        data_remaining: Data with only remaining features
+        list of numpy arrays, one per group
     """
-    data_top = data[:, selected_indices]
-    data_remaining = data[:, remaining_indices]
-    return data_top, data_remaining
+    return [data[:, group] for group in encoder_groups]
