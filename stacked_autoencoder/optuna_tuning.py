@@ -170,8 +170,8 @@ def create_optuna_objective(encoder_groups, data_groups_train, data_groups_test,
         latent_dim = trial.suggest_categorical("latent_dim", [16, 32, 64])
         num_layers = trial.suggest_int("num_layers", 1, 2)
         
-        learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True)
-        batch_size = trial.suggest_categorical("batch_size", [16, 32, 64, 128])
+        learning_rate = trial.suggest_float("learning_rate", 1e-4, 5e-2, log=True)
+        batch_size = trial.suggest_categorical("batch_size", [512, 640, 768, 896, 1024])
         
         kl_weight = trial.suggest_float("kl_weight", 0.01, 1.0, log=True)
         
