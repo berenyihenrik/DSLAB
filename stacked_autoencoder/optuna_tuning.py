@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Optuna hyperparameter optimization for LSTM VAE with stacked weighted encoders."""
+"""Optuna hyperparameter optimization for LSTM VAE with grouped encoders."""
 
 import copy
 import torch
@@ -12,8 +12,8 @@ from torch.utils.data import DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score
 
-from models import LSTMVAE_Stacked_Weighted
-from training import loss_function_weighted
+from models import LSTMVAE_Grouped
+from training import loss_function_grouped
 
 
 def train_model_for_optuna(model, train_loader, val_loader, optimizer, loss_fn, num_epochs=20, device='cpu', trial=None):
@@ -46,15 +46,13 @@ def train_model_for_optuna(model, train_loader, val_loader, optimizer, loss_fn, 
         train_loss = 0.0
         model.train()
         
-        for batch_top, batch_remaining in train_loader:
-            batch_top = torch.tensor(batch_top, dtype=torch.float32).to(device)
-            batch_remaining = torch.tensor(batch_remaining, dtype=torch.float32).to(device)
+        for batch in train_loader:
+            x_groups = [torch.as_tensor(g, dtype=torch.float32).to(device) for g in batch]
             
             optimizer.zero_grad()
             
-            recon_top, recon_remaining, mean, logvar = model(batch_top, batch_remaining)
-            loss = loss_fn(batch_top, batch_remaining, recon_top, recon_remaining, mean, logvar, 
-                          model.top_weight, model.remaining_weight)
+            x_recon, mean, logvar = model(x_groups)
+            loss = loss_fn(x_groups, x_recon, mean, logvar, model.group_weights, model.group_positions)
             
             loss.backward()
             optimizer.step()
@@ -68,13 +66,11 @@ def train_model_for_optuna(model, train_loader, val_loader, optimizer, loss_fn, 
         model.eval()
         valid_loss = 0.0
         with torch.no_grad():
-            for batch_top, batch_remaining in val_loader:
-                batch_top = torch.tensor(batch_top, dtype=torch.float32).to(device)
-                batch_remaining = torch.tensor(batch_remaining, dtype=torch.float32).to(device)
+            for batch in val_loader:
+                x_groups = [torch.as_tensor(g, dtype=torch.float32).to(device) for g in batch]
                 
-                recon_top, recon_remaining, mean, logvar = model(batch_top, batch_remaining)
-                loss = loss_fn(batch_top, batch_remaining, recon_top, recon_remaining, mean, logvar,
-                              model.top_weight, model.remaining_weight)
+                x_recon, mean, logvar = model(x_groups)
+                loss = loss_fn(x_groups, x_recon, mean, logvar, model.group_weights, model.group_positions)
                 valid_loss += loss.item()
 
         valid_loss /= len(val_loader)
@@ -120,20 +116,19 @@ def evaluate_for_optuna(model, test_loader, device, percentile_threshold, true_a
     anomaly_scores = []
 
     with torch.no_grad():
-        for batch_top, batch_remaining in test_loader:
-            batch_top = torch.tensor(batch_top, dtype=torch.float32).to(device)
-            batch_remaining = torch.tensor(batch_remaining, dtype=torch.float32).to(device)
+        for batch in test_loader:
+            x_groups = [torch.as_tensor(g, dtype=torch.float32).to(device) for g in batch]
 
-            batch_scores = []
-            for i in range(batch_top.shape[0]):
-                sequence_top = batch_top[i, :, :].unsqueeze(0)
-                sequence_remaining = batch_remaining[i, :, :].unsqueeze(0)
-                
-                recon_top, recon_remaining, mean, logvar = model(sequence_top, sequence_remaining)
-                loss = loss_function_weighted(sequence_top, sequence_remaining, recon_top, recon_remaining, 
-                                             mean, logvar, model.top_weight, model.remaining_weight)
-                batch_scores.append(loss.item())
-            anomaly_scores.extend(batch_scores)
+            x_recon, mean, logvar = model(x_groups)
+
+            for i in range(x_groups[0].shape[0]):
+                sample_groups = [g[i:i+1] for g in x_groups]
+                sample_recon = x_recon[i:i+1]
+                sample_mean = mean[i:i+1]
+                sample_logvar = logvar[i:i+1]
+                loss = loss_function_grouped(sample_groups, sample_recon, sample_mean, sample_logvar,
+                                             model.group_weights, model.group_positions)
+                anomaly_scores.append(loss.item())
 
     # Use the given percentile threshold
     adjusted_true_anomalies = true_anomalies[sequence_length-1:]
@@ -151,20 +146,15 @@ def evaluate_for_optuna(model, test_loader, device, percentile_threshold, true_a
     return f1, anomaly_scores
 
 
-def create_optuna_objective(selected_feature_indices, remaining_feature_indices, 
-                            metric_tensor_top, metric_tensor_remaining,
-                            metric_test_tensor_top, metric_test_tensor_remaining,
+def create_optuna_objective(encoder_groups, data_groups_train, data_groups_test,
                             true_anomalies, device):
     """
     Create an Optuna objective function with the given data context.
     
     Args:
-        selected_feature_indices: Indices of top features
-        remaining_feature_indices: Indices of remaining features
-        metric_tensor_top: Training data for top features
-        metric_tensor_remaining: Training data for remaining features
-        metric_test_tensor_top: Test data for top features
-        metric_test_tensor_remaining: Test data for remaining features
+        encoder_groups: list[list[int]] — feature indices per encoder group
+        data_groups_train: list of per-group training arrays
+        data_groups_test: list of per-group test arrays
         true_anomalies: Ground truth anomaly labels
         device: Device to use
     
@@ -176,56 +166,43 @@ def create_optuna_objective(selected_feature_indices, remaining_feature_indices,
         Optuna objective function for hyperparameter optimization.
         """
         # Hyperparameters to tune
-        top_weight = trial.suggest_float("top_weight", 0.3, 0.9)
-        remaining_weight = 1.0 - top_weight  # Ensure weights sum to 1
-        
         hidden_dim = trial.suggest_categorical("hidden_dim", [64, 128, 256])
         latent_dim = trial.suggest_categorical("latent_dim", [16, 32, 64])
         num_layers = trial.suggest_int("num_layers", 1, 2)
         
-        learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True)
-        batch_size = trial.suggest_categorical("batch_size", [16, 32, 64, 128])
+        learning_rate = trial.suggest_float("learning_rate", 1e-4, 5e-2, log=True)
+        batch_size = trial.suggest_categorical("batch_size", [512, 640, 768, 896, 1024])
         
         kl_weight = trial.suggest_float("kl_weight", 0.01, 1.0, log=True)
         
         percentile_threshold = trial.suggest_int("percentile_threshold", 50, 99)
         
         seq_length = 30
-        sequences_top = []
-        sequences_remaining = []
-        for i in range(metric_tensor_top.shape[0] - seq_length + 1):
-            sequences_top.append(metric_tensor_top[i:i + seq_length])
-            sequences_remaining.append(metric_tensor_remaining[i:i + seq_length])
+        n_samples = data_groups_train[0].shape[0] - seq_length + 1
+        sequences = []
+        for i in range(n_samples):
+            sample = tuple(dg[i:i+seq_length] for dg in data_groups_train)
+            sequences.append(sample)
         
-        sequences_combined = list(zip(sequences_top, sequences_remaining))
-        train_data_opt, val_data_opt = train_test_split(sequences_combined, test_size=0.3, random_state=42)
+        train_data_opt, val_data_opt = train_test_split(sequences, test_size=0.3, random_state=42)
         
-        test_sequences_top = []
-        test_sequences_remaining = []
-        for i in range(metric_test_tensor_top.shape[0] - seq_length + 1):
-            test_sequences_top.append(metric_test_tensor_top[i:i + seq_length])
-            test_sequences_remaining.append(metric_test_tensor_remaining[i:i + seq_length])
-        
-        test_sequences_opt = list(zip(test_sequences_top, test_sequences_remaining))
+        n_test_samples = data_groups_test[0].shape[0] - seq_length + 1
+        test_sequences = []
+        for i in range(n_test_samples):
+            sample = tuple(dg[i:i+seq_length] for dg in data_groups_test)
+            test_sequences.append(sample)
         
         train_loader_opt = DataLoader(dataset=train_data_opt, batch_size=batch_size, shuffle=True)
         val_loader_opt = DataLoader(dataset=val_data_opt, batch_size=batch_size, shuffle=False)
-        test_loader_opt = DataLoader(dataset=test_sequences_opt, batch_size=batch_size, shuffle=False)
+        test_loader_opt = DataLoader(dataset=test_sequences, batch_size=batch_size, shuffle=False)
         
-        num_top = len(selected_feature_indices)
-        num_remaining = len(remaining_feature_indices)
-        
-        model_opt = LSTMVAE_Stacked_Weighted(
-            num_top_sensors=num_top,
-            num_remaining_sensors=num_remaining,
-            input_dim=1,
+        model_opt = LSTMVAE_Grouped(
+            encoder_groups=encoder_groups,
             hidden_dim=hidden_dim,
             latent_dim=latent_dim,
             sequence_length=seq_length,
             num_layers=num_layers,
             device=device,
-            top_weight=top_weight,
-            remaining_weight=remaining_weight
         ).to(device)
         
         optimizer_opt = Adam(model_opt.parameters(), lr=learning_rate)
@@ -234,7 +211,7 @@ def create_optuna_objective(selected_feature_indices, remaining_feature_indices,
         try:
             train_losses, val_losses, best_val_loss = train_model_for_optuna(
                 model_opt, train_loader_opt, val_loader_opt, 
-                optimizer_opt, loss_function_weighted, 
+                optimizer_opt, loss_function_grouped, 
                 num_epochs=30, device=device, trial=trial
             )
         except optuna.exceptions.TrialPruned:
