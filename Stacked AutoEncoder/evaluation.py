@@ -5,10 +5,107 @@ import torch
 import numpy as np
 from sklearn.metrics import f1_score, classification_report, confusion_matrix, roc_auc_score, average_precision_score
 
-from training import loss_function_grouped
+from training import loss_function_grouped, loss_function_grouped_decomposed
 
 
-def evaluate_lstm_grouped(model, test_loader, device, percentile_threshold=90):
+def compute_anomaly_scores_grouped(model, loader, device, kl_weight=0.1):
+    """
+    Compute per-sample anomaly scores efficiently using decomposed loss.
+
+    Args:
+        model: Trained LSTMVAE_Grouped model
+        loader: Data loader (yields tuples of N tensors, one per group)
+        device: Device
+        kl_weight: KL weight used during training
+
+    Returns:
+        scores: List of anomaly scores (one per sequence)
+    """
+    model.eval()
+    scores = []
+    with torch.no_grad():
+        for batch in loader:
+            x_groups = [g.to(device) for g in batch]
+            x_recon, mean, logvar = model(x_groups)
+            total_per_sample, _ = loss_function_grouped_decomposed(
+                x_groups, x_recon, mean, logvar,
+                model.group_weights, model.group_positions,
+                latent_dim=model.latent_dim,
+                kl_weight=kl_weight,
+                return_timestep_errors=False,
+            )
+            scores.extend(total_per_sample.detach().cpu().numpy().tolist())
+    return scores
+
+
+def extract_anomaly_attributions(model, loader, device, indices, kl_weight=0.1):
+    """
+    Extract detailed per-group and per-feature attribution for specific sample indices.
+
+    Only computes the heavy (B, T, F) tensors for the requested indices to avoid
+    storing attributions for the entire test set.
+
+    Args:
+        model: Trained LSTMVAE_Grouped model
+        loader: Data loader (yields tuples of N tensors, one per group)
+        device: Device
+        indices: Iterable of sample indices to extract attributions for
+        kl_weight: KL weight used during training
+
+    Returns:
+        List of dicts, one per requested index, each containing:
+            index, window_start, window_end, score_total,
+            recon_contrib_by_group (G,), recon_contrib_by_feature (F,),
+            recon_sqerr_t_f (T, F), kld_total, kld_contrib_by_group (G,),
+            feature_order, encoder_groups
+    """
+    model.eval()
+    indices_set = set(indices)
+    results = []
+    global_i = 0
+
+    with torch.no_grad():
+        for batch in loader:
+            x_groups = [g.to(device) for g in batch]
+            B = x_groups[0].shape[0]
+
+            # Check if any requested index falls within this batch
+            batch_indices = set(range(global_i, global_i + B))
+            if not batch_indices & indices_set:
+                global_i += B
+                continue
+
+            x_recon, mean, logvar = model(x_groups)
+            total_per_sample, comp = loss_function_grouped_decomposed(
+                x_groups, x_recon, mean, logvar,
+                model.group_weights, model.group_positions,
+                latent_dim=model.latent_dim,
+                kl_weight=kl_weight,
+                return_timestep_errors=True,
+            )
+
+            for bi in range(B):
+                if global_i in indices_set:
+                    results.append({
+                        "index": global_i,
+                        "window_start": global_i,
+                        "window_end": global_i + model.sequence_length - 1,
+                        "score_total": float(total_per_sample[bi].cpu()),
+                        "recon_contrib_by_group": comp["recon_contrib_per_group"][bi].cpu().numpy(),
+                        "recon_contrib_by_feature": comp["recon_contrib_per_feature"][bi].cpu().numpy(),
+                        "recon_sqerr_t_f": comp["recon_sqerr_t_f"][bi].cpu().numpy(),
+                        "kld_total": float(comp["kld_total_per_sample"][bi].cpu()),
+                        "kld_contrib_by_group": comp["kld_contrib_per_group"][bi].cpu().numpy(),
+                        "feature_order": model.feature_order,
+                        "encoder_groups": model.encoder_groups,
+                    })
+                global_i += 1
+
+    return results
+
+
+def evaluate_lstm_grouped(model, test_loader, device, percentile_threshold=90,
+                          kl_weight=0.1, return_attributions=False):
     """
     Evaluate the grouped LSTM VAE model and return anomaly indices.
     
@@ -17,32 +114,26 @@ def evaluate_lstm_grouped(model, test_loader, device, percentile_threshold=90):
         test_loader: Test data loader (yields tuples of N tensors, one per group)
         device: Device
         percentile_threshold: Percentile threshold for anomaly detection
+        kl_weight: KL weight used during training
+        return_attributions: If True, perform a second pass to extract per-feature
+                            attribution dicts for each detected anomaly
     
     Returns:
         anomaly_indices: List of indices classified as anomalies
         anomaly_scores: List of anomaly scores for each sequence
+        attributions: (only if return_attributions=True) List of attribution dicts
     """
-    model.eval()
-    anomaly_scores = []
-
-    with torch.no_grad():
-        for batch in test_loader:
-            x_groups = [g.to(device) for g in batch]
-            batch_size = x_groups[0].shape[0]
-
-            x_recon, mean, logvar = model(x_groups)
-
-            for i in range(batch_size):
-                sample_groups = [g[i:i+1] for g in x_groups]
-                sample_recon = x_recon[i:i+1]
-                sample_mean = mean[i:i+1]
-                sample_logvar = logvar[i:i+1]
-                loss = loss_function_grouped(sample_groups, sample_recon, sample_mean, sample_logvar,
-                                             model.group_weights, model.group_positions)
-                anomaly_scores.append(loss.item())
+    anomaly_scores = compute_anomaly_scores_grouped(model, test_loader, device, kl_weight)
 
     threshold = np.percentile(anomaly_scores, percentile_threshold)
     anomaly_indices = [i for i, score in enumerate(anomaly_scores) if score > threshold]
+
+    if return_attributions:
+        attributions = extract_anomaly_attributions(
+            model, test_loader, device, anomaly_indices, kl_weight
+        )
+        return anomaly_indices, anomaly_scores, attributions
+
     return anomaly_indices, anomaly_scores
 
 

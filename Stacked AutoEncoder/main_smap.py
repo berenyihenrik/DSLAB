@@ -36,10 +36,11 @@ from optuna_tuning import (
 )
 from evaluation import (
     evaluate_lstm_weighted, calculate_f1_score_smap_msl,
-    point_adjust_f1_score, print_evaluation_results
+    point_adjust_f1_score, print_evaluation_results, extract_anomaly_attributions
 )
 from visualization import (
-    visualize_optuna_study, print_optuna_summary, print_final_summary
+    visualize_optuna_study, print_optuna_summary, print_final_summary,
+    plot_top_anomaly_heatmaps, plot_top_group_traces
 )
 from feature_selection import perform_feature_selection, split_features_by_groups
 
@@ -188,6 +189,28 @@ def main():
         anomaly_scores, anomalies, true_anomalies, sequence_length,
         final_percentile_threshold, anomaly_sequences
     )
+    
+    # Extract anomaly attributions and plot heatmaps
+    kl_weight = best_params.get('kl_weight', 0.1)
+    attributions = extract_anomaly_attributions(
+        model, test_loader_final, device, anomalies, kl_weight=kl_weight
+    )
+    heatmap_dir = f'heatmaps_{DATASET_TYPE}_{CHANNEL}'
+    plot_top_anomaly_heatmaps(
+        attributions, top_n=5, save_dir=heatmap_dir, kl_weight=kl_weight
+    )
+    print(f"Anomaly attribution heatmaps saved to: {heatmap_dir}/")
+
+    # Plot stacked time series traces for the most contributing group
+    traces_dir = f'stacked_traces_{DATASET_TYPE}_{CHANNEL}'
+    plot_top_group_traces(
+        attributions,
+        top_n=5,
+        group_id=None,
+        save_dir=traces_dir,
+        normalize="feature",
+    )
+    print(f"Stacked time series traces saved to: {traces_dir}/")
     
     # Visualize Optuna results if optimization was run
     if USE_OPTUNA and 'study' in dir():

@@ -51,7 +51,10 @@ class LSTMVAE_Grouped(nn.Module):
         self.sequence_length = sequence_length
         self.device = device
         self.n_total_features = sum(len(g) for g in encoder_groups)
-        n_groups = len(encoder_groups)
+        self.n_groups = len(encoder_groups)
+        self.latent_dim = latent_dim
+        self.total_latent_dim = self.n_groups * latent_dim
+        n_groups = self.n_groups
 
         self.encoders = nn.ModuleList([
             LSTMEncoder(len(group), hidden_dim, latent_dim, num_layers)
@@ -67,11 +70,19 @@ class LSTMVAE_Grouped(nn.Module):
 
         # Build group_positions: map each group's features to positions in sorted output
         all_indices = sorted([idx for group in encoder_groups for idx in group])
+        self.feature_order = all_indices
         index_to_pos = {idx: pos for pos, idx in enumerate(all_indices)}
         self.group_positions = [
             [index_to_pos[idx] for idx in group]
             for group in encoder_groups
         ]
+
+        # Map each decoder output position to its owning group index
+        pos_to_group = [0] * len(all_indices)
+        for gi, positions in enumerate(self.group_positions):
+            for p in positions:
+                pos_to_group[p] = gi
+        self.register_buffer('pos_to_group', torch.tensor(pos_to_group, dtype=torch.long))
 
         decoder_input_dim = n_groups * latent_dim
         self.decoder = SharedDecoder(

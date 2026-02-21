@@ -30,6 +30,86 @@ def loss_function_grouped(x_groups, x_recon, mean, log_var, group_weights, group
     return recon_loss + kl_weight * KLD
 
 
+def loss_function_grouped_decomposed(x_groups, x_recon, mean, log_var,
+                                     group_weights, group_positions,
+                                     latent_dim, kl_weight=0.1,
+                                     return_timestep_errors=True):
+    """
+    Decomposed loss returning per-sample, per-group, and per-feature contributions.
+
+    Args:
+        x_groups: list of tensors, one per group (batch, seq_len, group_size)
+        x_recon: reconstructed output (batch, seq_len, n_total_features)
+        mean: latent mean (batch, total_latent_dim)
+        log_var: latent log variance (batch, total_latent_dim)
+        group_weights: tensor of normalized weights per group
+        group_positions: list of lists, positions in x_recon for each group
+        latent_dim: latent dimension per encoder group
+        kl_weight: beta for KL term
+        return_timestep_errors: if True, include (B, T, F) squared-error tensor
+
+    Returns:
+        total_loss_per_sample: (batch,)
+        components: dict of attribution tensors
+    """
+    device = x_recon.device
+    batch, seq_len, n_total_features = x_recon.shape
+    n_groups = len(x_groups)
+    total_latent_dim = mean.shape[1]
+
+    # --- Reconstruction (per-feature / per-group) ---
+    recon_sqerr_t_f = torch.zeros((batch, seq_len, n_total_features), device=device) if return_timestep_errors else None
+    recon_mse_per_feature = torch.zeros((batch, n_total_features), device=device)
+    recon_mse_per_group = torch.zeros((batch, n_groups), device=device)
+
+    for gi, (x_g, positions) in enumerate(zip(x_groups, group_positions)):
+        x_recon_g = x_recon[:, :, positions]
+        sqerr = (x_recon_g - x_g) ** 2
+
+        mse_feat = sqerr.mean(dim=1)  # (batch, group_size)
+        recon_mse_per_feature[:, positions] = mse_feat
+        recon_mse_per_group[:, gi] = mse_feat.mean(dim=1)
+
+        if return_timestep_errors:
+            recon_sqerr_t_f[:, :, positions] = sqerr
+
+    recon_contrib_per_group = recon_mse_per_group * group_weights.unsqueeze(0)
+
+    # Per-feature weights from owning group
+    pos_to_group = torch.empty(n_total_features, dtype=torch.long, device=device)
+    for gi, positions in enumerate(group_positions):
+        for p in positions:
+            pos_to_group[p] = gi
+    per_feature_weight = group_weights[pos_to_group]
+    recon_contrib_per_feature = recon_mse_per_feature * per_feature_weight.unsqueeze(0)
+
+    recon_loss_per_sample = recon_contrib_per_group.sum(dim=1)
+
+    # --- KL divergence (per-group decomposition) ---
+    kld_per_dim = -0.5 * (1 + log_var - mean.pow(2) - log_var.exp())
+    kld_total_per_sample = kld_per_dim.mean(dim=1)
+
+    kld_contrib_per_group = torch.zeros((batch, n_groups), device=device)
+    for gi in range(n_groups):
+        s = gi * latent_dim
+        e = (gi + 1) * latent_dim
+        kld_contrib_per_group[:, gi] = kld_per_dim[:, s:e].sum(dim=1) / total_latent_dim
+
+    # --- Total ---
+    total_loss_per_sample = recon_loss_per_sample + kl_weight * kld_total_per_sample
+
+    components = {
+        "recon_mse_per_group": recon_mse_per_group,
+        "recon_contrib_per_group": recon_contrib_per_group,
+        "recon_mse_per_feature": recon_mse_per_feature,
+        "recon_contrib_per_feature": recon_contrib_per_feature,
+        "recon_sqerr_t_f": recon_sqerr_t_f,
+        "kld_total_per_sample": kld_total_per_sample,
+        "kld_contrib_per_group": kld_contrib_per_group,
+    }
+    return total_loss_per_sample, components
+
+
 def train_model_grouped(model, train_loader, val_loader, optimizer, loss_fn, scheduler, num_epochs=10,
                         device='cpu', use_amp=True):
     """
