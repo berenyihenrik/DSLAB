@@ -4,7 +4,7 @@
 Stage 0: Drop static features (std == 0 or IQR == 0).
 Stage 1: Redundancy clustering via lagged Spearman correlation + agglomerative clustering.
 Stage 2: AE masking importance — train a small LSTM-AE on cluster representatives,
-         then measure per-feature reconstruction loss increase under block permutation.
+         then measure other-features reconstruction loss increase under circular-shift corruption.
 Stage 3: Group-aware encoder assignment — rank clusters by importance, assign
          high-importance clusters to individual encoders and merge the rest.
 """
@@ -14,7 +14,6 @@ import torch
 import torch.nn as nn
 from scipy.stats import spearmanr
 from scipy.cluster.hierarchy import linkage, fcluster
-from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, TensorDataset
 
 
@@ -211,15 +210,17 @@ def _compute_redundancy_clusters(train_data, corr_threshold=0.9, max_lag=30,
 # Stage 2: AE masking importance
 # ---------------------------------------------------------------------------
 
-def _block_permute(arr, block_size, rng=None):
-    """Permute an array in contiguous blocks to preserve local temporal structure."""
-    if rng is None:
-        rng = np.random.RandomState()
+def _circular_shift(arr, rng):
+    """Circular-shift a 1-D array by a random offset in [1, len-1].
+
+    Preserves the feature's marginal distribution and autocorrelation
+    while breaking cross-feature temporal alignment.
+    """
     n = len(arr)
-    n_blocks = max(1, n // block_size)
-    blocks = np.array_split(arr, n_blocks)
-    perm = rng.permutation(len(blocks))
-    return np.concatenate([blocks[i] for i in perm])
+    if n <= 1:
+        return arr.copy()
+    k = rng.randint(1, n)  # shift in [1, n-1]
+    return np.roll(arr, k)
 
 
 def _compute_masking_importance(
@@ -230,10 +231,11 @@ def _compute_masking_importance(
     hidden_dim=64,
     num_epochs=30,
     batch_size=64,
-    n_repeats=3,
+    n_repeats=10,
 ):
     """Train a small LSTM-AE on the representative features and score each
-    feature by reconstruction-loss increase under block permutation.
+    feature by reconstruction-loss increase on *other* features under
+    circular-shift corruption.
 
     Args:
         train_data: array (timesteps, n_features) — only the kept features
@@ -243,7 +245,7 @@ def _compute_masking_importance(
         hidden_dim: hidden size for the small AE
         num_epochs: training epochs for the small AE
         batch_size: batch size for AE training
-        n_repeats: number of permutation repeats to average importance
+        n_repeats: number of corruption repeats to average importance
 
     Returns:
         importance_scores: array of shape (len(representative_indices),)
@@ -265,8 +267,12 @@ def _compute_masking_importance(
         sequences.append(data[i: i + sequence_length])
     sequences = np.array(sequences)  # (N, seq_len, n_features)
 
-    # Train / val split
-    train_seq, val_seq = train_test_split(sequences, test_size=0.3, random_state=42)
+    # Temporal train / val split (no shuffling, with gap to avoid overlap)
+    N = sequences.shape[0]
+    split = int(0.7 * N)
+    gap = sequence_length
+    train_seq = sequences[:max(1, split - gap)]
+    val_seq = sequences[split:]
     train_tensor = torch.tensor(train_seq, dtype=torch.float32)
     val_tensor = torch.tensor(val_seq, dtype=torch.float32)
 
@@ -279,6 +285,7 @@ def _compute_masking_importance(
     criterion = nn.MSELoss()
 
     print(f"\nStage 2 — Training small LSTM-AE ({n_features} features, {num_epochs} epochs)...")
+    print(f"  Temporal split: {train_seq.shape[0]} train / {val_seq.shape[0]} val (gap={gap})")
     model.train()
     for epoch in range(num_epochs):
         epoch_loss = 0.0
@@ -293,33 +300,43 @@ def _compute_masking_importance(
         if (epoch + 1) % 10 == 0 or epoch == 0:
             print(f"  Epoch {epoch+1:3d}/{num_epochs}  loss={epoch_loss / len(train_loader):.6f}")
 
-    # Compute baseline MSE on val set
+    # Compute per-feature baseline MSE on val set (for "other features" metric)
     model.eval()
     val_device = val_tensor.to(device)
     with torch.no_grad():
         baseline_recon = model(val_device)
-        baseline_mse = torch.mean((baseline_recon - val_device) ** 2).item()
-    print(f"  Baseline val MSE: {baseline_mse:.6f}")
+    # baseline_other_mse[fi] = MSE on all features except fi
+    baseline_other_mse = np.zeros(n_features)
+    for fi in range(n_features):
+        mask = [j for j in range(n_features) if j != fi]
+        baseline_other_mse[fi] = torch.mean(
+            (baseline_recon[:, :, mask] - val_device[:, :, mask]) ** 2
+        ).item()
+    print(f"  Baseline val MSE (global): {torch.mean((baseline_recon - val_device) ** 2).item():.6f}")
 
-    # Per-feature importance via block permutation
+    # Per-feature importance via circular-shift corruption
+    # Metric: Δ-loss on *other* features only (measures dependency/utility)
     importance_scores = np.zeros(n_features)
     rng = np.random.RandomState(42)
 
     for fi in range(n_features):
         delta_sum = 0.0
+        mask = [j for j in range(n_features) if j != fi]
         for _ in range(n_repeats):
             corrupted = val_seq.copy()  # (N, seq_len, n_features)
-            # Block-permute feature fi across the time axis within each sample
+            # Circular-shift feature fi within each sample
             for si in range(corrupted.shape[0]):
-                corrupted[si, :, fi] = _block_permute(corrupted[si, :, fi], block_size=max(1, sequence_length // 4), rng=rng)
+                corrupted[si, :, fi] = _circular_shift(corrupted[si, :, fi], rng)
             corrupted_tensor = torch.tensor(corrupted, dtype=torch.float32).to(device)
             with torch.no_grad():
                 recon_corrupted = model(corrupted_tensor)
-                mse_corrupted = torch.mean((recon_corrupted - val_device) ** 2).item()
-            delta_sum += mse_corrupted - baseline_mse
+                mse_other = torch.mean(
+                    (recon_corrupted[:, :, mask] - val_device[:, :, mask]) ** 2
+                ).item()
+            delta_sum += mse_other - baseline_other_mse[fi]
         importance_scores[fi] = delta_sum / n_repeats
 
-    print("\n  Feature masking importance (ΔMSE):")
+    print(f"\n  Feature importance (Δ other-features MSE, {n_repeats} repeats, circular shift):")
     ranked = np.argsort(importance_scores)[::-1]
     for rank, fi in enumerate(ranked):
         orig_idx = representative_indices[fi]
@@ -456,6 +473,146 @@ def perform_feature_selection(train_data, n_features, sequence_length, device,
     print(f"\n  Dropped static features ({len(dropped_feature_indices)}): {dropped_feature_indices}")
 
     return encoder_groups, dropped_feature_indices
+
+
+def precompute_feature_selection_cache(train_data, sequence_length, device,
+                                       lambda_grid=(None, 5, 10, 15)):
+    """Precompute expensive feature selection stages once for fast Optuna derivation.
+
+    Runs Stage 0 (drop static), Stage 1 (similarity/linkage for each lambda in
+    the grid), and Stage 2 (importance for ALL kept features) upfront so that
+    ``derive_encoder_groups`` can produce encoder groups in <1 ms per trial.
+
+    Args:
+        train_data: array of shape (timesteps, n_features)
+        sequence_length: window length for sequences
+        device: torch device
+        lambda_grid: tuple of lag_penalty_lambda values to precompute
+
+    Returns:
+        cache dict with keys:
+            kept_indices, dropped_indices,
+            linkages: {lambda_val: (similarity, dist_matrix, Z)},
+            all_importance_scores: array of shape (n_kept,)
+    """
+    print("=" * 60)
+    print("Precomputing feature selection cache for Optuna...")
+    print("=" * 60)
+
+    # Stage 0
+    kept_indices, dropped_indices = _drop_static_features(train_data)
+    if len(kept_indices) == 0:
+        return {
+            'kept_indices': kept_indices,
+            'dropped_indices': dropped_indices,
+            'linkages': {},
+            'all_importance_scores': np.array([]),
+        }
+
+    kept_data = train_data[:, kept_indices]
+    n_kept = kept_data.shape[1]
+    max_lag = sequence_length
+
+    # Stage 1: precompute similarity + linkage for each lambda
+    linkages = {}
+    for lam in lambda_grid:
+        lam_str = f"λ={lam}" if lam is not None else "λ=None (no penalty)"
+        print(f"\nPrecomputing Stage 1 similarity matrix for {lam_str}...")
+        similarity = _compute_lagged_spearman_similarity(kept_data, max_lag, lam)
+        dist_matrix = 1.0 - similarity
+        np.fill_diagonal(dist_matrix, 0.0)
+        dist_matrix = np.clip(dist_matrix, 0.0, 1.0)
+        condensed = dist_matrix[np.triu_indices(n_kept, k=1)]
+        Z = linkage(condensed, method='average')
+        linkages[lam] = (similarity, dist_matrix, Z)
+        print(f"  Done. Similarity matrix shape: {similarity.shape}")
+
+    # Stage 2: importance scores for ALL kept features
+    print(f"\nComputing importance scores for all {n_kept} kept features...")
+    all_indices = np.arange(n_kept)
+    all_importance_scores = _compute_masking_importance(
+        kept_data, all_indices, sequence_length, device
+    )
+
+    print("\n" + "=" * 60)
+    print("Feature selection cache precomputed successfully.")
+    print(f"  Kept features: {n_kept}, Lambda grid: {list(lambda_grid)}")
+    print("=" * 60)
+
+    return {
+        'kept_indices': kept_indices,
+        'dropped_indices': dropped_indices,
+        'linkages': linkages,
+        'all_importance_scores': all_importance_scores,
+    }
+
+
+def derive_encoder_groups(cache, corr_threshold=0.9, importance_percentile=50,
+                          lag_penalty_lambda=None):
+    """Instantly derive encoder groups from precomputed cache (<1 ms).
+
+    Args:
+        cache: dict from precompute_feature_selection_cache
+        corr_threshold: |correlation| above which features are clustered
+        importance_percentile: percentile cutoff for importance scores
+        lag_penalty_lambda: must be a value present in the precomputed grid
+
+    Returns:
+        encoder_groups: list[list[int]] of original feature indices
+        dropped_feature_indices: list[int]
+    """
+    kept_indices = cache['kept_indices']
+    dropped_indices = cache['dropped_indices']
+    all_importance = cache['all_importance_scores']
+
+    if len(kept_indices) == 0:
+        return [], dropped_indices.tolist()
+
+    similarity, dist_matrix, Z = cache['linkages'][lag_penalty_lambda]
+
+    cluster_labels = fcluster(Z, t=1.0 - corr_threshold, criterion='distance')
+
+    unique_clusters = np.unique(cluster_labels)
+    cluster_members_dict = {}
+    cluster_importance = {}
+
+    for cid in unique_clusters:
+        members = np.where(cluster_labels == cid)[0]
+        cluster_members_dict[cid] = members.tolist()
+
+        if len(members) == 1:
+            medoid = members[0]
+        else:
+            sub_dist = dist_matrix[np.ix_(members, members)]
+            medoid = members[np.argmin(sub_dist.sum(axis=1))]
+
+        cluster_importance[cid] = all_importance[medoid]
+
+    scores = np.array(list(cluster_importance.values()))
+    cids = list(cluster_importance.keys())
+    threshold = np.percentile(scores, importance_percentile)
+
+    high_clusters = [(cid, cluster_importance[cid]) for cid in cids
+                     if cluster_importance[cid] >= threshold]
+    low_clusters = [(cid, cluster_importance[cid]) for cid in cids
+                    if cluster_importance[cid] < threshold]
+
+    high_clusters.sort(key=lambda x: x[1], reverse=True)
+
+    encoder_groups = []
+    for cid, imp in high_clusters:
+        local_members = cluster_members_dict[cid]
+        original_members = sorted(kept_indices[m] for m in local_members)
+        encoder_groups.append(original_members)
+
+    catch_all = []
+    for cid, imp in low_clusters:
+        local_members = cluster_members_dict[cid]
+        catch_all.extend(kept_indices[m] for m in local_members)
+    if catch_all:
+        encoder_groups.append(sorted(catch_all))
+
+    return encoder_groups, dropped_indices.tolist()
 
 
 def split_features_by_groups(data, encoder_groups):

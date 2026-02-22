@@ -46,7 +46,7 @@ BATCH_SIZE = 32
 
 # Training settings
 LEARNING_RATE = 1e-3
-NUM_EPOCHS = 256
+NUM_EPOCHS = 50
 EARLY_STOP_PATIENCE = 10
 
 # Performance toggles
@@ -64,17 +64,21 @@ PIN_MEMORY = False
 
 # Optuna settings
 USE_OPTUNA = False
-N_OPTUNA_TRIALS = 50
+N_OPTUNA_TRIALS = 25
 
 # Default hyperparameters (used when not using Optuna)
-DEFAULT_PARAMS = { # For SMD
+DEFAULT_PARAMS = { # For SMD — Optuna trial #23 (F1=0.7513 @ 15ep, temporal split)
     'hidden_dim': 256,
     'latent_dim': 32,
     'num_layers': 2,
-    'learning_rate': 0.00242243676, # 7.570114875046537e-05, - for batch size 16
-    'batch_size': 512,
-    'percentile_threshold': 93,
-    'kl_weight': 0.06450689704528334
+    'learning_rate': 0.00010220995184614862,
+    'batch_size': 1024,
+    'percentile_threshold': 92,
+    'kl_weight': 0.17652893214507678,
+    # Feature selection params
+    'corr_threshold': 0.8283783592848791,
+    'importance_percentile': 48,
+    'lag_penalty_lambda': 15,
 }
 
 # Device configuration

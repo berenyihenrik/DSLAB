@@ -8,7 +8,54 @@ from sklearn.metrics import f1_score, classification_report, confusion_matrix, r
 from training import loss_function_grouped
 
 
-def evaluate_lstm_grouped(model, test_loader, device, percentile_threshold=90):
+def window_recon_score(model, x_groups, mode="group_weighted", k=5):
+    """Compute per-sample anomaly score using reconstruction error only.
+    
+    Args:
+        model: Trained LSTMVAE_Grouped model
+        x_groups: list of tensors, one per group (batch, seq_len, group_size)
+        mode: scoring mode - "group_weighted", "full_mean", "mean", "max", or "topk"
+        k: number of top features for "topk" mode
+    
+    Returns:
+        scores: tensor of shape (batch,) with per-sample anomaly scores
+    """
+    x_recon, _, _ = model(x_groups)
+
+    if mode == "group_weighted":
+        batch_size = x_groups[0].shape[0]
+        recon = torch.zeros(batch_size, device=x_groups[0].device)
+        for i, (x_g, pos) in enumerate(zip(x_groups, model.group_positions)):
+            recon_g = x_recon[:, :, pos]
+            group_loss = ((recon_g - x_g) ** 2).mean(dim=(1, 2))
+            recon += model.group_weights[i] * group_loss
+        return recon
+
+    errs = []
+    for x_g, pos in zip(x_groups, model.group_positions):
+        recon_g = x_recon[:, :, pos]
+        errs.append((recon_g - x_g) ** 2)
+
+    err = torch.cat(errs, dim=2)  # (B, T, F_total)
+
+    if mode == "full_mean":
+        return err.mean(dim=(1, 2))
+
+    last = err[:, -1, :]  # (B, F_total)
+
+    if mode == "mean":
+        return last.mean(dim=1)
+    if mode == "max":
+        return last.max(dim=1).values
+    if mode == "topk":
+        kk = min(k, last.shape[1])
+        return last.topk(kk, dim=1).values.mean(dim=1)
+
+    raise ValueError("mode must be group_weighted/full_mean/mean/max/topk")
+
+
+def evaluate_lstm_grouped(model, test_loader, device, percentile_threshold=90,
+                          scoring="group_weighted", topk_k=5, smooth_window=7):
     """
     Evaluate the grouped LSTM VAE model and return anomaly indices.
     
@@ -17,6 +64,9 @@ def evaluate_lstm_grouped(model, test_loader, device, percentile_threshold=90):
         test_loader: Test data loader (yields tuples of N tensors, one per group)
         device: Device
         percentile_threshold: Percentile threshold for anomaly detection
+        scoring: Scoring mode - "group_weighted", "full_mean", "topk", "mean", "max", or "loss"
+        topk_k: k for topk scoring mode
+        smooth_window: rolling average window for score smoothing (0 to disable)
     
     Returns:
         anomaly_indices: List of indices classified as anomalies
@@ -28,18 +78,26 @@ def evaluate_lstm_grouped(model, test_loader, device, percentile_threshold=90):
     with torch.no_grad():
         for batch in test_loader:
             x_groups = [g.to(device) for g in batch]
-            batch_size = x_groups[0].shape[0]
 
-            x_recon, mean, logvar = model(x_groups)
+            if scoring == "loss":
+                x_recon, mean, logvar = model(x_groups)
+                batch_size = x_groups[0].shape[0]
+                for i in range(batch_size):
+                    sample_groups = [g[i:i+1] for g in x_groups]
+                    sample_recon = x_recon[i:i+1]
+                    sample_mean = mean[i:i+1]
+                    sample_logvar = logvar[i:i+1]
+                    loss = loss_function_grouped(sample_groups, sample_recon, sample_mean, sample_logvar,
+                                                 model.group_weights, model.group_positions)
+                    anomaly_scores.append(loss.item())
+            else:
+                scores = window_recon_score(model, x_groups, mode=scoring, k=topk_k)
+                anomaly_scores.extend(scores.detach().cpu().numpy().tolist())
 
-            for i in range(batch_size):
-                sample_groups = [g[i:i+1] for g in x_groups]
-                sample_recon = x_recon[i:i+1]
-                sample_mean = mean[i:i+1]
-                sample_logvar = logvar[i:i+1]
-                loss = loss_function_grouped(sample_groups, sample_recon, sample_mean, sample_logvar,
-                                             model.group_weights, model.group_positions)
-                anomaly_scores.append(loss.item())
+    # Apply rolling average smoothing to reduce noisy predictions
+    if smooth_window > 1:
+        kernel = np.ones(smooth_window) / smooth_window
+        anomaly_scores = np.convolve(anomaly_scores, kernel, mode='same').tolist()
 
     threshold = np.percentile(anomaly_scores, percentile_threshold)
     anomaly_indices = [i for i, score in enumerate(anomaly_scores) if score > threshold]

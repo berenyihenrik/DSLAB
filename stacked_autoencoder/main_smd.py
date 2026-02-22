@@ -8,12 +8,13 @@ Refactored to work with SMD (Server Machine Dataset) for anomaly detection.
 """
 
 import os
+import functools
 import numpy as np
 import torch
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
-from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import RobustScaler
 
 # Import from modular components
 from config import (
@@ -29,16 +30,20 @@ from data_loader import (
 from models import LSTMVAE_Grouped
 from training import loss_function_grouped, train_model_grouped, save_model
 from optuna_tuning import (
-    create_optuna_objective, run_optuna_study, evaluate_for_optuna
+    create_optuna_objective, create_optuna_objective_with_fs,
+    run_optuna_study, evaluate_for_optuna
 )
 from evaluation import (
-    evaluate_lstm_weighted, calculate_f1_score,
+    evaluate_lstm_grouped, calculate_f1_score,
     print_evaluation_results_simple
 )
 from visualization import (
     visualize_optuna_study, print_optuna_summary, print_final_summary
 )
-from feature_selection import perform_feature_selection, split_features_by_groups
+from feature_selection import (
+    perform_feature_selection, split_features_by_groups,
+    precompute_feature_selection_cache, derive_encoder_groups
+)
 
 
 def set_seed(seed=42):
@@ -72,29 +77,17 @@ def main(seed=0):
     metric_tensor = preprocess_data(metric_tensor)
     metric_test_tensor = preprocess_data(metric_test_tensor)
     
+    # Normalize: fit on train only, apply to both
+    scaler = RobustScaler(quantile_range=(25, 75))
+    scaler.fit(metric_tensor)
+    metric_tensor = scaler.transform(metric_tensor).astype(np.float32)
+    metric_test_tensor = scaler.transform(metric_test_tensor).astype(np.float32)
+    print("Applied RobustScaler normalization (train-fitted)")
+    
     sequence_length = SEQUENCE_LENGTH
     device = DEVICE
     print(f"Using device: {device}")
     print(f"Number of features: {metric_tensor.shape[1]}")
-    
-    # Perform feature selection (grouped, on training data only)
-    encoder_groups, dropped_feature_indices = perform_feature_selection(
-        metric_tensor, metric_tensor.shape[1], sequence_length, device
-    )
-    
-    print(f"\nEncoder groups: {len(encoder_groups)}")
-    for i, group in enumerate(encoder_groups):
-        print(f"  Group {i}: {len(group)} features")
-    if dropped_feature_indices:
-        print(f"  Dropped features: {len(dropped_feature_indices)}")
-    
-    # Split features by groups
-    data_groups_train = split_features_by_groups(metric_tensor, encoder_groups)
-    data_groups_test = split_features_by_groups(metric_test_tensor, encoder_groups)
-    
-    # Create grouped sequences
-    sequences_grouped = create_grouped_sequences(data_groups_train, sequence_length)
-    test_sequences_grouped = create_grouped_sequences(data_groups_test, sequence_length)
     
     # DataLoader kwargs
     num_workers = min(DATALOADER_WORKERS, max(0, (os.cpu_count() or 2) // 2))
@@ -104,15 +97,22 @@ def main(seed=0):
         "persistent_workers": num_workers > 0,
     }
     
-    # Optuna hyperparameter tuning or use defaults
+    # Optuna hyperparameter tuning (jointly tunes feature selection + model)
+    # or use defaults with fixed feature selection
     if USE_OPTUNA:
-        # Create objective function with data context
-        objective_fn = create_optuna_objective(
-            encoder_groups, data_groups_train, data_groups_test,
-            true_anomalies, device
+        # Precompute feature selection cache (Stage 0, 1, 2) once
+        lambda_grid = (None, 5, 10, 15)
+        cache = precompute_feature_selection_cache(
+            metric_tensor, sequence_length, device, lambda_grid=lambda_grid
         )
         
-        # Extract machine name without extension for study naming
+        # Create joint objective (feature selection + model params)
+        objective_fn = create_optuna_objective_with_fs(
+            cache, metric_tensor, metric_test_tensor,
+            true_anomalies, device,
+            lambda_grid=lambda_grid, num_epochs=15
+        )
+        
         machine_name = MACHINE.replace('.txt', '')
         
         study = run_optuna_study(
@@ -124,10 +124,42 @@ def main(seed=0):
         best_params = study.best_params
         if 'kl_weight' not in best_params:
             best_params['kl_weight'] = 0.1
+        
+        # Derive final encoder groups from best feature selection params
+        lambda_map = {repr(l): l for l in lambda_grid}
+        best_lambda = lambda_map[best_params['lag_penalty_lambda']]
+        encoder_groups, dropped_feature_indices = derive_encoder_groups(
+            cache,
+            corr_threshold=best_params['corr_threshold'],
+            importance_percentile=best_params['importance_percentile'],
+            lag_penalty_lambda=best_lambda
+        )
         print("\nUsing optimized hyperparameters for final training...")
     else:
+        # Use same cache+derive path as Optuna for consistent feature selection
         best_params = DEFAULT_PARAMS.copy()
+        best_lambda = best_params.get('lag_penalty_lambda', None)
+        cache = precompute_feature_selection_cache(
+            metric_tensor, sequence_length, device,
+            lambda_grid=(best_lambda,)
+        )
+        encoder_groups, dropped_feature_indices = derive_encoder_groups(
+            cache,
+            corr_threshold=best_params.get('corr_threshold', 0.9),
+            importance_percentile=best_params.get('importance_percentile', 50),
+            lag_penalty_lambda=best_lambda,
+        )
         print("Using default hyperparameters...")
+    
+    print(f"\nEncoder groups: {len(encoder_groups)}")
+    for i, group in enumerate(encoder_groups):
+        print(f"  Group {i}: {len(group)} features")
+    if dropped_feature_indices:
+        print(f"  Dropped features: {len(dropped_feature_indices)}")
+    
+    # Split features by groups
+    data_groups_train = split_features_by_groups(metric_tensor, encoder_groups)
+    data_groups_test = split_features_by_groups(metric_test_tensor, encoder_groups)
     
     print("\nFinal training parameters:")
     for key, value in best_params.items():
@@ -141,13 +173,20 @@ def main(seed=0):
     final_batch_size = best_params['batch_size']
     final_percentile_threshold = best_params['percentile_threshold']
     
-    # Create final data loaders with optimized batch size
-    sequences_grouped_final = create_grouped_sequences(data_groups_train, sequence_length)
+    # Temporal train/val split: split raw time series before windowing
+    T = metric_tensor.shape[0]
+    split_idx = int(T * 0.7)
+    train_raw = metric_tensor[:split_idx]
+    val_raw = metric_tensor[max(0, split_idx - (sequence_length - 1)):]  # overlap for first val window
+    
+    train_groups_final = split_features_by_groups(train_raw, encoder_groups)
+    val_groups_final = split_features_by_groups(val_raw, encoder_groups)
+    
+    train_data_final = create_grouped_sequences(train_groups_final, sequence_length)
+    val_data_final = create_grouped_sequences(val_groups_final, sequence_length)
     test_sequences_grouped_final = create_grouped_sequences(data_groups_test, sequence_length)
     
-    train_data_final, val_data_final = train_test_split(
-        sequences_grouped_final, test_size=0.3, random_state=42
-    )
+    print(f"Temporal split: {len(train_data_final)} train / {len(val_data_final)} val sequences")
     
     train_loader_final = DataLoader(dataset=train_data_final, batch_size=final_batch_size, shuffle=True, **loader_kwargs)
     val_loader_final = DataLoader(dataset=val_data_final, batch_size=final_batch_size, shuffle=False, **loader_kwargs)
@@ -167,13 +206,15 @@ def main(seed=0):
         model = torch.compile(model)
     
     optimizer = Adam(model.parameters(), lr=final_learning_rate)
-    scheduler = ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.1)
+    scheduler = ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5, min_lr=1e-5)
     
-    print(f"\nTraining final model with {len(encoder_groups)} encoder groups...")
+    kl_weight = best_params.get('kl_weight', 0.1)
+    loss_fn = functools.partial(loss_function_grouped, kl_weight=kl_weight)
+    print(f"\nTraining final model with {len(encoder_groups)} encoder groups (kl_weight={kl_weight:.6f})...")
     
     train_losses, val_losses = train_model_grouped(
         model, train_loader_final, val_loader_final,
-        optimizer, loss_function_grouped, scheduler,
+        optimizer, loss_fn, scheduler,
         num_epochs=NUM_EPOCHS, device=device, use_amp=USE_AMP
     )
     
@@ -183,15 +224,12 @@ def main(seed=0):
     save_model(model, model_name, INPUT_DIM, final_latent_dim, final_hidden_dim)
     print(f"\nOptimized model saved as: {model_name}.pth")
     
-    # Evaluate the model
-    print("\n--- Evaluating Final Model ---")
-    final_f1, anomaly_scores = evaluate_for_optuna(
+    # Evaluate the model using group-weighted recon scoring with smoothing
+    print("\n--- Evaluating Final Model (group-weighted recon scoring) ---")
+    anomalies, anomaly_scores = evaluate_lstm_grouped(
         model, test_loader_final, device,
-        final_percentile_threshold, true_anomalies, sequence_length
+        final_percentile_threshold, scoring="group_weighted", smooth_window=7
     )
-    
-    threshold_value = np.percentile(anomaly_scores, final_percentile_threshold)
-    anomalies = [i for i, score in enumerate(anomaly_scores) if score > threshold_value]
     
     # Print evaluation results (without point-adjust for SMD)
     f1, predicted_anomalies, adjusted_true_anomalies = print_evaluation_results_simple(
@@ -203,7 +241,7 @@ def main(seed=0):
     if USE_OPTUNA and 'study' in dir():
         print_optuna_summary(study, "SMD", machine_name)
         visualize_optuna_study(study, save_path=f'optuna_SMD_{machine_name}',
-                              dataset_name="SMD", identifier=machine_name)
+                               dataset_name="SMD", identifier=machine_name)
     
     # Print final summary (without point-adjust results)
     print_final_summary("SMD", machine_name, best_params, f1, pa_results=None)
