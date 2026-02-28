@@ -2,7 +2,7 @@
 """Four-stage unsupervised feature selection on training data only.
 
 Stage 0: Drop static features (std == 0 or IQR == 0).
-Stage 1: Redundancy clustering via Spearman correlation + agglomerative clustering.
+Stage 1: Redundancy clustering via lagged Spearman correlation + agglomerative clustering.
 Stage 2: AE masking importance — train a small LSTM-AE on cluster representatives,
          then measure per-feature reconstruction loss increase under block permutation.
 Stage 3: Group-aware encoder assignment — rank clusters by importance, assign
@@ -73,16 +73,81 @@ def _drop_static_features(train_data):
 
 
 # ---------------------------------------------------------------------------
-# Stage 1: Redundancy clustering
+# Stage 1: Redundancy clustering (lagged Spearman)
 # ---------------------------------------------------------------------------
 
-def _compute_redundancy_clusters(train_data, corr_threshold=0.9):
-    """Cluster features by Spearman correlation and pick one representative
-    per cluster (highest IQR variance).  Preserves full cluster membership.
+def _compute_lagged_spearman_similarity(train_data, max_lag, lag_penalty_lambda=None):
+    """Pairwise similarity via max lagged |Spearman rho| on first-differenced data.
+
+    Steps:
+        1. First-difference the data to remove drift / shared trends.
+        2. For each lag tau in [-max_lag, max_lag], compute pairwise
+           Spearman correlation between diff_i(t) and diff_j(t + tau).
+        3. similarity(i, j) = max_tau  |rho_ij(tau)| * w(tau)
+           where w(tau) = exp(-|tau| / lambda) if lambda is set, else 1.
+
+    Args:
+        train_data: array of shape (timesteps, n_features)
+        max_lag: maximum lag L; tau ranges over [-L, L]
+        lag_penalty_lambda: decay constant for the lag penalty; None disables it
+
+    Returns:
+        similarity: array of shape (n_features, n_features) in [0, 1]
+    """
+    diff_data = np.diff(train_data, axis=0)  # (T-1, F)
+    T, F = diff_data.shape
+
+    # Clamp max_lag so we keep at least half the samples for correlation
+    max_lag = min(max_lag, T // 2)
+
+    similarity = np.zeros((F, F))
+
+    for tau in range(-max_lag, max_lag + 1):
+        # Align arrays for this lag
+        if tau > 0:
+            x = diff_data[:T - tau]
+            y = diff_data[tau:]
+        elif tau < 0:
+            x = diff_data[-tau:]
+            y = diff_data[:T + tau]
+        else:
+            x = diff_data
+            y = diff_data
+
+        # Compute Spearman cross-correlation
+        if F == 1:
+            rho, _ = spearmanr(x[:, 0], y[:, 0])
+            cross_corr = np.atleast_2d(rho)
+        else:
+            # spearmanr(a, b) with a=(N,F), b=(N,F) returns (2F, 2F);
+            # the cross-block [0:F, F:2F] holds corr(a_i, b_j).
+            combined_corr, _ = spearmanr(x, y)
+            cross_corr = combined_corr[:F, F:]
+
+        cross_corr = np.nan_to_num(cross_corr, nan=0.0)
+
+        weight = np.exp(-abs(tau) / lag_penalty_lambda) if lag_penalty_lambda else 1.0
+        weighted = np.abs(cross_corr) * weight
+        similarity = np.maximum(similarity, weighted)
+
+    # Self-similarity = 1; enforce exact symmetry
+    np.fill_diagonal(similarity, 1.0)
+    similarity = np.maximum(similarity, similarity.T)
+
+    return similarity
+
+
+def _compute_redundancy_clusters(train_data, corr_threshold=0.9, max_lag=30,
+                                 lag_penalty_lambda=None):
+    """Cluster features by lagged Spearman correlation and pick one representative
+    per cluster (medoid — most central member in correlation-distance space).
+    Preserves full cluster membership.
 
     Args:
         train_data: array of shape (timesteps, n_features)
         corr_threshold: |corr| above which features are merged
+        max_lag: maximum lag for lagged Spearman similarity
+        lag_penalty_lambda: optional decay constant for lag penalty
 
     Returns:
         representative_indices: 1-D array of selected feature column indices
@@ -90,22 +155,18 @@ def _compute_redundancy_clusters(train_data, corr_threshold=0.9):
         cluster_labels: cluster id for every column in train_data
         cluster_members_dict: dict mapping cluster_id → list of column indices
             (positions within *train_data*)
+        cluster_rep_dict: dict mapping cluster_id → representative column index
     """
     n_features = train_data.shape[1]
 
-    # Spearman correlation matrix
-    corr_matrix, _ = spearmanr(train_data)
-    # spearmanr returns a scalar when n_features==2; ensure matrix
-    corr_matrix = np.atleast_2d(corr_matrix)
+    # Lagged Spearman similarity matrix
+    similarity = _compute_lagged_spearman_similarity(
+        train_data, max_lag, lag_penalty_lambda
+    )
 
-    # Replace NaN correlations (from constant features) with 0 (max distance)
-    corr_matrix = np.nan_to_num(corr_matrix, nan=0.0)
-
-    # Distance = 1 - |corr|
-    dist_matrix = 1.0 - np.abs(corr_matrix)
+    # Distance = 1 - similarity
+    dist_matrix = 1.0 - similarity
     np.fill_diagonal(dist_matrix, 0.0)
-    # Ensure numerical symmetry and finite values
-    dist_matrix = (dist_matrix + dist_matrix.T) / 2.0
     dist_matrix = np.clip(dist_matrix, 0.0, 1.0)
     # Condensed form for scipy
     condensed = dist_matrix[np.triu_indices(n_features, k=1)]
@@ -114,40 +175,50 @@ def _compute_redundancy_clusters(train_data, corr_threshold=0.9):
     Z = linkage(condensed, method='average')
     cluster_labels = fcluster(Z, t=1.0 - corr_threshold, criterion='distance')
 
-    # For each cluster, pick the feature with the highest IQR
-    iqr_scores = np.subtract(*np.percentile(train_data, [75, 25], axis=0))
+    # For each cluster, pick the medoid (most central member in distance space)
     representative_indices = []
     cluster_members_dict = {}
+    cluster_rep_dict = {}
     unique_clusters = np.unique(cluster_labels)
     for cid in unique_clusters:
         members = np.where(cluster_labels == cid)[0]
         cluster_members_dict[cid] = members.tolist()
-        best = members[np.argmax(iqr_scores[members])]
+        if len(members) == 1:
+            best = members[0]
+        else:
+            sub_dist = dist_matrix[np.ix_(members, members)]
+            best = members[np.argmin(sub_dist.sum(axis=1))]
+        cluster_rep_dict[cid] = best
         representative_indices.append(best)
 
     representative_indices = np.sort(representative_indices)
 
-    print(f"\nStage 1 — Redundancy clustering:")
+    lag_info = f"max_lag={max_lag}"
+    if lag_penalty_lambda is not None:
+        lag_info += f", λ={lag_penalty_lambda}"
+    print(f"\nStage 1 — Redundancy clustering (lagged Spearman, {lag_info}):")
     print(f"  {n_features} features → {len(unique_clusters)} clusters (threshold |corr| > {corr_threshold})")
     print(f"  Representative indices (local): {representative_indices.tolist()}")
     for cid in unique_clusters:
         members = cluster_members_dict[cid]
-        rep = members[np.argmax(iqr_scores[members])]
-        print(f"    Cluster {cid}: members {members}, representative {rep}")
+        rep = cluster_rep_dict[cid]
+        print(f"    Cluster {cid}: members {members}, representative {rep} (medoid)")
 
-    return representative_indices, cluster_labels, cluster_members_dict
+    return representative_indices, cluster_labels, cluster_members_dict, cluster_rep_dict
 
 
 # ---------------------------------------------------------------------------
 # Stage 2: AE masking importance
 # ---------------------------------------------------------------------------
 
-def _block_permute(arr, block_size):
+def _block_permute(arr, block_size, rng=None):
     """Permute an array in contiguous blocks to preserve local temporal structure."""
+    if rng is None:
+        rng = np.random.RandomState()
     n = len(arr)
     n_blocks = max(1, n // block_size)
     blocks = np.array_split(arr, n_blocks)
-    perm = np.random.permutation(len(blocks))
+    perm = rng.permutation(len(blocks))
     return np.concatenate([blocks[i] for i in perm])
 
 
@@ -180,6 +251,13 @@ def _compute_masking_importance(
     # Subset to representative features
     data = train_data[:, representative_indices].astype(np.float32)
     n_features = data.shape[1]
+
+    # Robust per-feature scaling (median / IQR) so ΔMSE reflects dynamics, not scale
+    medians = np.median(data, axis=0)
+    q75, q25 = np.percentile(data, [75, 25], axis=0)
+    iqrs = q75 - q25
+    iqrs[iqrs == 0] = 1.0
+    data = (data - medians) / iqrs
 
     # Create sequences
     sequences = []
@@ -233,7 +311,7 @@ def _compute_masking_importance(
             corrupted = val_seq.copy()  # (N, seq_len, n_features)
             # Block-permute feature fi across the time axis within each sample
             for si in range(corrupted.shape[0]):
-                corrupted[si, :, fi] = _block_permute(corrupted[si, :, fi], block_size=max(1, sequence_length // 4))
+                corrupted[si, :, fi] = _block_permute(corrupted[si, :, fi], block_size=max(1, sequence_length // 4), rng=rng)
             corrupted_tensor = torch.tensor(corrupted, dtype=torch.float32).to(device)
             with torch.no_grad():
                 recon_corrupted = model(corrupted_tensor)
@@ -255,11 +333,12 @@ def _compute_masking_importance(
 # ---------------------------------------------------------------------------
 
 def perform_feature_selection(train_data, n_features, sequence_length, device,
-                              corr_threshold=0.9, importance_percentile=50):
+                              corr_threshold=0.9, importance_percentile=50,
+                              lag_penalty_lambda=None):
     """Four-stage unsupervised feature selection on training data only.
 
     Stage 0: Drop static features (std == 0 or IQR == 0).
-    Stage 1: Spearman correlation clustering → group redundant features.
+    Stage 1: Lagged Spearman correlation clustering → group redundant features.
     Stage 2: LSTM-AE masking importance → score cluster representatives.
     Stage 3: Group-aware encoder assignment → build encoder groups.
 
@@ -268,10 +347,14 @@ def perform_feature_selection(train_data, n_features, sequence_length, device,
         n_features: Total number of features
         sequence_length: Window length used for sequences
         device: torch device (for AE training)
-        corr_threshold: |correlation| above which features are clustered together
+        corr_threshold: |correlation| above which features are clustered together.
+            Note: lagged correlation inflates similarities vs lag-0; consider
+            increasing to 0.92–0.95 when using the default lagged method.
         importance_percentile: Percentile cutoff for importance scores; clusters
             with representative importance >= this percentile get their own
             encoder group.  Lower clusters are merged into a catch-all group.
+        lag_penalty_lambda: optional decay constant for the lag penalty
+            w(tau) = exp(-|tau| / lambda).  None disables it (all lags equal).
 
     Returns:
         encoder_groups: list[list[int]] — each inner list is original feature indices
@@ -290,8 +373,10 @@ def perform_feature_selection(train_data, n_features, sequence_length, device,
     kept_data = train_data[:, kept_indices]
 
     # Stage 1: redundancy clustering (on kept features only)
-    representative_local, cluster_labels, cluster_members_dict = \
-        _compute_redundancy_clusters(kept_data, corr_threshold)
+    representative_local, cluster_labels, cluster_members_dict, cluster_rep_dict = \
+        _compute_redundancy_clusters(kept_data, corr_threshold,
+                                     max_lag=sequence_length,
+                                     lag_penalty_lambda=lag_penalty_lambda)
 
     # Stage 2: AE masking importance on representatives
     importance_scores = _compute_masking_importance(
@@ -304,11 +389,10 @@ def perform_feature_selection(train_data, n_features, sequence_length, device,
         rep_to_importance[rep_local] = importance_scores[i]
 
     # Map each cluster to its representative's importance score
-    iqr_scores = np.subtract(*np.percentile(kept_data, [75, 25], axis=0))
     cluster_importance = {}
     cluster_representative = {}
-    for cid, members in cluster_members_dict.items():
-        rep = members[np.argmax(iqr_scores[members])]
+    for cid in cluster_members_dict:
+        rep = cluster_rep_dict[cid]
         cluster_representative[cid] = rep
         cluster_importance[cid] = rep_to_importance[rep]
 

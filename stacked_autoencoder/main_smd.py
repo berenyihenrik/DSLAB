@@ -41,8 +41,18 @@ from visualization import (
 from feature_selection import perform_feature_selection, split_features_by_groups
 
 
-def main():
+def set_seed(seed=42):
+    """Set random seeds for reproducibility."""
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def main(seed=0):
     """Main execution function for SMD dataset."""
+    set_seed(seed)
     if torch.cuda.is_available() and CUDNN_BENCHMARK:
         torch.backends.cudnn.benchmark = True
     
