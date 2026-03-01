@@ -34,7 +34,7 @@ class SharedDecoder(nn.Module):
 
 class LSTMVAE_Grouped(nn.Module):
     def __init__(self, encoder_groups, hidden_dim, latent_dim, sequence_length,
-                 num_layers=1, device='cpu', group_weights=None):
+                 num_layers=1, device='cpu', group_weights=None, binary_group_flags=None):
         """
         Args:
             encoder_groups: list[list[int]] — feature indices per encoder group
@@ -45,12 +45,16 @@ class LSTMVAE_Grouped(nn.Module):
             device: torch device
             group_weights: optional list of floats (one per group) for loss weighting.
                           If None, all groups weighted equally.
+            binary_group_flags: optional list[bool] — one per group, True if all
+                               features in that group are binary. Used to select
+                               BCE loss instead of MSE for those groups.
         """
         super(LSTMVAE_Grouped, self).__init__()
         self.encoder_groups = encoder_groups
         self.sequence_length = sequence_length
         self.device = device
         self.n_total_features = sum(len(g) for g in encoder_groups)
+        self.binary_group_flags = binary_group_flags
         n_groups = len(encoder_groups)
 
         self.encoders = nn.ModuleList([
