@@ -37,7 +37,8 @@ from optuna_tuning import (
 )
 from evaluation import (
     evaluate_lstm_weighted, calculate_f1_score_smap_msl,
-    point_adjust_f1_score, print_evaluation_results, fit_group_ecdf
+    point_adjust_f1_score, print_evaluation_results, fit_group_ecdf,
+    compute_threshold_from_baseline
 )
 from visualization import (
     visualize_optuna_study, print_optuna_summary, print_final_summary
@@ -259,7 +260,7 @@ def main():
     save_model(model, model_name, INPUT_DIM, final_latent_dim, final_hidden_dim)
     print(f"\nOptimized model saved as: {model_name}.pth")
     
-    # Evaluate the model (calibrated two-sided ECDF scoring)
+    # Evaluate the model (threshold derived from validation scores)
     print("\n--- Evaluating Final Model ---")
     final_f1, anomaly_scores = evaluate_for_optuna(
         model, test_loader_final, device,
@@ -268,7 +269,8 @@ def main():
         baseline_loader=val_loader_final
     )
     
-    threshold_value = np.percentile(anomaly_scores, final_percentile_threshold)
+    threshold_value, val_scores = compute_threshold_from_baseline(
+        model, val_loader_final, device, final_percentile_threshold)
     anomalies = [i for i, score in enumerate(anomaly_scores) if score > threshold_value]
     
     # Get anomaly sequences for point-adjust evaluation
@@ -282,12 +284,12 @@ def main():
         final_percentile_threshold, anomaly_sequences
     )
     
-    # Threshold sweep to find optimal percentile
+    # Threshold sweep — thresholds derived from validation scores
     adjusted_true = true_anomalies[sequence_length-1:]
-    print("\n--- Threshold Sweep ---")
+    print("\n--- Threshold Sweep (validation-calibrated) ---")
     best_sweep_f1, best_sweep_pct = 0, 0
     for pct in range(85, 100):
-        thr = np.percentile(anomaly_scores, pct)
+        thr = np.percentile(val_scores, pct)
         preds = np.array([1 if s > thr else 0 for s in anomaly_scores[:len(adjusted_true)]])
         from sklearn.metrics import f1_score as f1_fn
         sweep_f1 = f1_fn(adjusted_true, preds, zero_division=0)

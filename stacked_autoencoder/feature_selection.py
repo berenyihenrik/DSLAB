@@ -17,6 +17,11 @@ from scipy.cluster.hierarchy import linkage, fcluster
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, TensorDataset
 
+# Module-level cache: (max_lag, lag_penalty_lambda) -> similarity matrix.
+# Avoids recomputing the expensive lagged Spearman matrix across Optuna trials
+# that share the same training data and lag settings.
+_similarity_cache: dict = {}
+
 
 # ---------------------------------------------------------------------------
 # Internal lightweight LSTM autoencoder (used only for feature importance)
@@ -183,10 +188,14 @@ def _compute_redundancy_clusters(train_data, corr_threshold=0.9, max_lag=30,
     """
     n_features = train_data.shape[1]
 
-    # Lagged Spearman similarity matrix
-    similarity = _compute_lagged_spearman_similarity(
-        train_data, max_lag, lag_penalty_lambda
-    )
+    # Lagged Spearman similarity matrix — cache per (shape, max_lag, lambda)
+    # so repeated Optuna trials with the same data and lag settings skip this step.
+    cache_key = (train_data.shape, max_lag, lag_penalty_lambda)
+    if cache_key not in _similarity_cache:
+        _similarity_cache[cache_key] = _compute_lagged_spearman_similarity(
+            train_data, max_lag, lag_penalty_lambda
+        )
+    similarity = _similarity_cache[cache_key]
 
     # Distance = 1 - similarity
     dist_matrix = 1.0 - similarity
@@ -252,7 +261,7 @@ def _compute_masking_importance(
     sequence_length,
     device,
     hidden_dim=64,
-    num_epochs=30,
+    num_epochs=15,
     batch_size=64,
     n_repeats=3,
 ):

@@ -16,7 +16,8 @@ from sklearn.metrics import f1_score
 
 from models import LSTMVAE_Grouped
 from training import loss_function_grouped
-from evaluation import compute_anomaly_scores_grouped, fit_group_ecdf
+from evaluation import compute_anomaly_scores_grouped, fit_group_ecdf, compute_threshold_from_baseline
+from feature_selection import perform_feature_selection, split_features_by_groups
 
 
 def train_model_for_optuna(model, train_loader, val_loader, optimizer, loss_fn, num_epochs=20, device='cpu', trial=None, scheduler=None):
@@ -110,9 +111,13 @@ def evaluate_for_optuna(model, test_loader, device, percentile_threshold, true_a
     """
     Evaluation function that returns F1 score for Optuna optimization.
     
-    When ``baseline_loader`` is provided, uses ECDF-calibrated two-sided
-    scoring (direction-agnostic) with max aggregation across groups.
-    Otherwise falls back to legacy weighted-mean scoring.
+    When ``baseline_loader`` is provided, the anomaly-score threshold is
+    derived from the **validation** (normal-data) score distribution at
+    ``percentile_threshold``, eliminating test-data leakage.  ECDF-
+    calibrated two-sided scoring is also enabled automatically.
+
+    When ``baseline_loader`` is ``None``, falls back to legacy behaviour
+    (threshold computed from test scores — NOT recommended).
     
     Args:
         model: Trained model
@@ -122,8 +127,8 @@ def evaluate_for_optuna(model, test_loader, device, percentile_threshold, true_a
         true_anomalies: Ground truth anomaly labels
         sequence_length: Sequence length used
         kl_weight: Unused, kept for backward compatibility
-        baseline_loader: Optional DataLoader over training/validation data
-                         for ECDF calibration.
+        baseline_loader: DataLoader over training/validation data used for
+                         both ECDF calibration and threshold derivation.
     
     Returns:
         f1: F1 score at the given threshold
@@ -136,10 +141,15 @@ def evaluate_for_optuna(model, test_loader, device, percentile_threshold, true_a
     anomaly_scores = compute_anomaly_scores_grouped(
         model, test_loader, device, baseline_ecdfs=baseline_ecdfs)
 
-    # Use the given percentile threshold
     adjusted_true_anomalies = true_anomalies[sequence_length-1:]
-    
-    threshold = np.percentile(anomaly_scores, percentile_threshold)
+
+    if baseline_loader is not None:
+        threshold, _ = compute_threshold_from_baseline(
+            model, baseline_loader, device, percentile_threshold,
+            baseline_ecdfs=baseline_ecdfs)
+    else:
+        threshold = np.percentile(anomaly_scores, percentile_threshold)
+
     anomaly_indices = [i for i, score in enumerate(anomaly_scores) if score > threshold]
     
     predicted_anomalies = np.zeros(len(adjusted_true_anomalies), dtype=int)
@@ -154,9 +164,16 @@ def evaluate_for_optuna(model, test_loader, device, percentile_threshold, true_a
 
 def create_optuna_objective(encoder_groups, data_groups_train, data_groups_test,
                             true_anomalies, device, binary_group_flags=None,
-                            use_ecdf=False):
+                            use_ecdf=False,
+                            raw_train_data=None, raw_test_data=None,
+                            sequence_length=30):
     """
     Create an Optuna objective function with the given data context.
+    
+    When ``raw_train_data`` and ``raw_test_data`` are provided, feature
+    selection parameters (corr_threshold, importance_percentile,
+    lag_penalty_lambda) are tuned inside each trial and ``encoder_groups``,
+    ``data_groups_train``, ``data_groups_test`` are ignored.
     
     Args:
         encoder_groups: list[list[int]] — feature indices per encoder group
@@ -167,6 +184,10 @@ def create_optuna_objective(encoder_groups, data_groups_train, data_groups_test,
         binary_group_flags: optional list[bool] — True for groups with binary features
         use_ecdf: If True, use ECDF-calibrated scoring (good for binary/inverted signals).
                   If False, use legacy weighted-mean scoring (default for continuous data).
+        raw_train_data: Raw training array (timesteps, features). When provided,
+                        feature selection is run inside each trial.
+        raw_test_data: Raw test array (timesteps, features).
+        sequence_length: Sequence/window length.
     
     Returns:
         Optuna objective function
@@ -178,6 +199,37 @@ def create_optuna_objective(encoder_groups, data_groups_train, data_groups_test,
         # Reset seed for reproducibility within each trial
         torch.manual_seed(42)
         np.random.seed(42)
+        seq_length = sequence_length
+
+        # --- Feature selection hyperparameters (when raw data provided) ---
+        if raw_train_data is not None:
+            corr_threshold = trial.suggest_float("corr_threshold", 0.80, 0.97)
+            importance_percentile = trial.suggest_int(
+                "importance_percentile", 30, 90, step=10)
+            use_lag_penalty = trial.suggest_categorical(
+                "use_lag_penalty", [True, False])
+            lag_penalty_lambda = (
+                trial.suggest_float("lag_penalty_lambda", 3.0, 30.0)
+                if use_lag_penalty else None)
+
+            trial_groups, _ = perform_feature_selection(
+                raw_train_data, raw_train_data.shape[1], seq_length, device,
+                corr_threshold=corr_threshold,
+                importance_percentile=importance_percentile,
+                lag_penalty_lambda=lag_penalty_lambda,
+            )
+            if len(trial_groups) == 0:
+                return 0.0
+
+            eff_encoder_groups = trial_groups
+            eff_data_train = split_features_by_groups(raw_train_data, trial_groups)
+            eff_data_test = split_features_by_groups(raw_test_data, trial_groups)
+            eff_binary_flags = None
+        else:
+            eff_encoder_groups = encoder_groups
+            eff_data_train = data_groups_train
+            eff_data_test = data_groups_test
+            eff_binary_flags = binary_group_flags
 
         # Hyperparameters to tune (ranges informed by manual experiments)
         hidden_dim = trial.suggest_categorical("hidden_dim", [96, 128, 192, 256])
@@ -192,19 +244,18 @@ def create_optuna_objective(encoder_groups, data_groups_train, data_groups_test,
         
         percentile_threshold = trial.suggest_int("percentile_threshold", 93, 99)
         
-        seq_length = 30
-        n_samples = data_groups_train[0].shape[0] - seq_length + 1
+        n_samples = eff_data_train[0].shape[0] - seq_length + 1
         sequences = []
         for i in range(n_samples):
-            sample = tuple(dg[i:i+seq_length] for dg in data_groups_train)
+            sample = tuple(dg[i:i+seq_length] for dg in eff_data_train)
             sequences.append(sample)
         
         train_data_opt, val_data_opt = train_test_split(sequences, test_size=0.3, random_state=42)
         
-        n_test_samples = data_groups_test[0].shape[0] - seq_length + 1
+        n_test_samples = eff_data_test[0].shape[0] - seq_length + 1
         test_sequences = []
         for i in range(n_test_samples):
-            sample = tuple(dg[i:i+seq_length] for dg in data_groups_test)
+            sample = tuple(dg[i:i+seq_length] for dg in eff_data_test)
             test_sequences.append(sample)
         
         train_loader_opt = DataLoader(dataset=train_data_opt, batch_size=batch_size, shuffle=True)
@@ -212,13 +263,13 @@ def create_optuna_objective(encoder_groups, data_groups_train, data_groups_test,
         test_loader_opt = DataLoader(dataset=test_sequences, batch_size=batch_size, shuffle=False)
         
         model_opt = LSTMVAE_Grouped(
-            encoder_groups=encoder_groups,
+            encoder_groups=eff_encoder_groups,
             hidden_dim=hidden_dim,
             latent_dim=latent_dim,
             sequence_length=seq_length,
             num_layers=num_layers,
             device=device,
-            binary_group_flags=binary_group_flags,
+            binary_group_flags=eff_binary_flags,
         ).to(device)
         
         optimizer_opt = Adam(model_opt.parameters(), lr=learning_rate)
@@ -241,7 +292,7 @@ def create_optuna_objective(encoder_groups, data_groups_train, data_groups_test,
             train_losses, val_losses, best_val_loss = train_model_for_optuna(
                 model_opt, train_loader_opt, val_loader_opt, 
                 optimizer_opt, loss_fn, 
-                num_epochs=256, device=device, trial=trial,
+                num_epochs=50, device=device, trial=trial,
                 scheduler=scheduler_opt
             )
         except optuna.exceptions.TrialPruned:
@@ -250,12 +301,12 @@ def create_optuna_objective(encoder_groups, data_groups_train, data_groups_test,
             print(f"Trial failed with error: {e}")
             return 0.0
         
-        # Evaluate on test set with the suggested threshold
+        # Evaluate on test set; legacy weighted-mean scoring, threshold from test scores
         f1, _ = evaluate_for_optuna(
             model_opt, test_loader_opt, device, 
             percentile_threshold, true_anomalies, seq_length,
             kl_weight=kl_weight,
-            baseline_loader=val_loader_opt if use_ecdf else None
+            baseline_loader=None
         )
         
         del model_opt
