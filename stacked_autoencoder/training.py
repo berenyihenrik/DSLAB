@@ -7,9 +7,12 @@ import torch
 import torch.nn as nn
 
 
-def loss_function_grouped(x_groups, x_recon, mean, log_var, group_weights, group_positions, kl_weight=0.1):
+def loss_function_grouped(x_groups, x_recon, mean, log_var, group_weights, group_positions,
+                          kl_weight=0.1, binary_group_flags=None):
     """
     Compute group-weighted reconstruction loss + KL divergence.
+    
+    Uses BCE loss for binary feature groups and MSE for continuous groups.
     
     Args:
         x_groups: list of tensors, one per group (batch, seq_len, group_size)
@@ -19,11 +22,16 @@ def loss_function_grouped(x_groups, x_recon, mean, log_var, group_weights, group
         group_weights: tensor of normalized weights per group
         group_positions: list of lists, positions in x_recon for each group
         kl_weight: beta for KL term
+        binary_group_flags: optional list[bool], True if group features are binary
     """
     recon_loss = 0.0
     for i, (x_g, positions) in enumerate(zip(x_groups, group_positions)):
         x_recon_g = x_recon[:, :, positions]
-        group_loss = nn.functional.mse_loss(x_recon_g, x_g, reduction='mean')
+        if binary_group_flags is not None and binary_group_flags[i]:
+            group_loss = nn.functional.binary_cross_entropy_with_logits(
+                x_recon_g, x_g, reduction='mean')
+        else:
+            group_loss = nn.functional.mse_loss(x_recon_g, x_g, reduction='mean')
         recon_loss = recon_loss + group_weights[i] * group_loss
 
     KLD = -0.5 * torch.mean(1 + log_var - mean.pow(2) - log_var.exp())
@@ -82,7 +90,8 @@ def train_model_grouped(model, train_loader, val_loader, optimizer, loss_fn, sch
             with torch.cuda.amp.autocast(enabled=use_amp):
                 x_recon, mean, logvar = model(x_groups)
                 loss = loss_fn(x_groups, x_recon, mean, logvar,
-                               model.group_weights, model.group_positions)
+                               model.group_weights, model.group_positions,
+                               binary_group_flags=model.binary_group_flags)
 
             forward_time += time.time() - t0
 
@@ -111,13 +120,15 @@ def train_model_grouped(model, train_loader, val_loader, optimizer, loss_fn, sch
                 with torch.cuda.amp.autocast(enabled=use_amp):
                     x_recon, mean, logvar = model(x_groups)
                     loss = loss_fn(x_groups, x_recon, mean, logvar,
-                                   model.group_weights, model.group_positions)
+                                   model.group_weights, model.group_positions,
+                                   binary_group_flags=model.binary_group_flags)
                 valid_loss += loss.item()
 
         valid_loss /= len(val_loader)
         val_losses.append(valid_loss)
 
-        scheduler.step(valid_loss)
+        if scheduler is not None:
+            scheduler.step(valid_loss)
 
         epoch_time = time.time() - epoch_start_time
 

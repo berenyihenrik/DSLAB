@@ -2,21 +2,24 @@
 """Optuna hyperparameter optimization for LSTM VAE with grouped encoders."""
 
 import copy
+from functools import partial
 import torch
 import numpy as np
 import joblib
 import optuna
 from optuna.trial import TrialState
 from torch.optim import Adam
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score
 
 from models import LSTMVAE_Grouped
 from training import loss_function_grouped
+from evaluation import compute_anomaly_scores_grouped, fit_group_ecdf
 
 
-def train_model_for_optuna(model, train_loader, val_loader, optimizer, loss_fn, num_epochs=20, device='cpu', trial=None):
+def train_model_for_optuna(model, train_loader, val_loader, optimizer, loss_fn, num_epochs=20, device='cpu', trial=None, scheduler=None):
     """
     Training function optimized for Optuna trials with early stopping and pruning.
     
@@ -29,6 +32,7 @@ def train_model_for_optuna(model, train_loader, val_loader, optimizer, loss_fn, 
         num_epochs: Maximum number of epochs
         device: Device to train on
         trial: Optuna trial for pruning
+        scheduler: Optional learning rate scheduler
     
     Returns:
         train_losses, val_losses, best_loss
@@ -38,7 +42,7 @@ def train_model_for_optuna(model, train_loader, val_loader, optimizer, loss_fn, 
     val_losses = []
 
     early_stop_tolerant_count = 0
-    early_stop_tolerant = 5  # Shorter patience for Optuna trials
+    early_stop_tolerant = 10  # Match final training patience
     best_loss = float('inf')
     best_model_wts = copy.deepcopy(model.state_dict())
 
@@ -52,7 +56,8 @@ def train_model_for_optuna(model, train_loader, val_loader, optimizer, loss_fn, 
             optimizer.zero_grad()
             
             x_recon, mean, logvar = model(x_groups)
-            loss = loss_fn(x_groups, x_recon, mean, logvar, model.group_weights, model.group_positions)
+            loss = loss_fn(x_groups, x_recon, mean, logvar, model.group_weights, model.group_positions,
+                           binary_group_flags=model.binary_group_flags)
             
             loss.backward()
             optimizer.step()
@@ -70,11 +75,15 @@ def train_model_for_optuna(model, train_loader, val_loader, optimizer, loss_fn, 
                 x_groups = [torch.as_tensor(g, dtype=torch.float32).to(device) for g in batch]
                 
                 x_recon, mean, logvar = model(x_groups)
-                loss = loss_fn(x_groups, x_recon, mean, logvar, model.group_weights, model.group_positions)
+                loss = loss_fn(x_groups, x_recon, mean, logvar, model.group_weights, model.group_positions,
+                               binary_group_flags=model.binary_group_flags)
                 valid_loss += loss.item()
 
         valid_loss /= len(val_loader)
         val_losses.append(valid_loss)
+
+        if scheduler is not None:
+            scheduler.step(valid_loss)
 
         if valid_loss < best_loss:
             best_loss = valid_loss
@@ -96,9 +105,14 @@ def train_model_for_optuna(model, train_loader, val_loader, optimizer, loss_fn, 
     return train_losses, val_losses, best_loss
 
 
-def evaluate_for_optuna(model, test_loader, device, percentile_threshold, true_anomalies, sequence_length):
+def evaluate_for_optuna(model, test_loader, device, percentile_threshold, true_anomalies, sequence_length,
+                        kl_weight=0.1, baseline_loader=None):
     """
     Evaluation function that returns F1 score for Optuna optimization.
+    
+    When ``baseline_loader`` is provided, uses ECDF-calibrated two-sided
+    scoring (direction-agnostic) with max aggregation across groups.
+    Otherwise falls back to legacy weighted-mean scoring.
     
     Args:
         model: Trained model
@@ -107,28 +121,20 @@ def evaluate_for_optuna(model, test_loader, device, percentile_threshold, true_a
         percentile_threshold: Percentile threshold for anomaly detection
         true_anomalies: Ground truth anomaly labels
         sequence_length: Sequence length used
+        kl_weight: Unused, kept for backward compatibility
+        baseline_loader: Optional DataLoader over training/validation data
+                         for ECDF calibration.
     
     Returns:
         f1: F1 score at the given threshold
         anomaly_scores: List of anomaly scores for each sequence
     """
-    model.eval()
-    anomaly_scores = []
+    baseline_ecdfs = None
+    if baseline_loader is not None:
+        baseline_ecdfs = fit_group_ecdf(model, baseline_loader, device)
 
-    with torch.no_grad():
-        for batch in test_loader:
-            x_groups = [torch.as_tensor(g, dtype=torch.float32).to(device) for g in batch]
-
-            x_recon, mean, logvar = model(x_groups)
-
-            for i in range(x_groups[0].shape[0]):
-                sample_groups = [g[i:i+1] for g in x_groups]
-                sample_recon = x_recon[i:i+1]
-                sample_mean = mean[i:i+1]
-                sample_logvar = logvar[i:i+1]
-                loss = loss_function_grouped(sample_groups, sample_recon, sample_mean, sample_logvar,
-                                             model.group_weights, model.group_positions)
-                anomaly_scores.append(loss.item())
+    anomaly_scores = compute_anomaly_scores_grouped(
+        model, test_loader, device, baseline_ecdfs=baseline_ecdfs)
 
     # Use the given percentile threshold
     adjusted_true_anomalies = true_anomalies[sequence_length-1:]
@@ -147,7 +153,8 @@ def evaluate_for_optuna(model, test_loader, device, percentile_threshold, true_a
 
 
 def create_optuna_objective(encoder_groups, data_groups_train, data_groups_test,
-                            true_anomalies, device):
+                            true_anomalies, device, binary_group_flags=None,
+                            use_ecdf=False):
     """
     Create an Optuna objective function with the given data context.
     
@@ -157,6 +164,9 @@ def create_optuna_objective(encoder_groups, data_groups_train, data_groups_test,
         data_groups_test: list of per-group test arrays
         true_anomalies: Ground truth anomaly labels
         device: Device to use
+        binary_group_flags: optional list[bool] — True for groups with binary features
+        use_ecdf: If True, use ECDF-calibrated scoring (good for binary/inverted signals).
+                  If False, use legacy weighted-mean scoring (default for continuous data).
     
     Returns:
         Optuna objective function
@@ -165,17 +175,22 @@ def create_optuna_objective(encoder_groups, data_groups_train, data_groups_test,
         """
         Optuna objective function for hyperparameter optimization.
         """
-        # Hyperparameters to tune
-        hidden_dim = trial.suggest_categorical("hidden_dim", [64, 128, 256])
-        latent_dim = trial.suggest_categorical("latent_dim", [16, 32, 64])
+        # Reset seed for reproducibility within each trial
+        torch.manual_seed(42)
+        np.random.seed(42)
+
+        # Hyperparameters to tune (ranges informed by manual experiments)
+        hidden_dim = trial.suggest_categorical("hidden_dim", [96, 128, 192, 256])
+        latent_dim = trial.suggest_int("latent_dim", 4, 16)
         num_layers = trial.suggest_int("num_layers", 1, 2)
         
-        learning_rate = trial.suggest_float("learning_rate", 1e-4, 5e-2, log=True)
+        learning_rate = trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True)
         batch_size = trial.suggest_categorical("batch_size", [512, 640, 768, 896, 1024])
         
-        kl_weight = trial.suggest_float("kl_weight", 0.01, 1.0, log=True)
+        # Sharp phase transition at ~0.005; search narrow range
+        kl_weight = trial.suggest_float("kl_weight", 0.003, 0.015, log=True)
         
-        percentile_threshold = trial.suggest_int("percentile_threshold", 50, 99)
+        percentile_threshold = trial.suggest_int("percentile_threshold", 93, 99)
         
         seq_length = 30
         n_samples = data_groups_train[0].shape[0] - seq_length + 1
@@ -203,16 +218,31 @@ def create_optuna_objective(encoder_groups, data_groups_train, data_groups_test,
             sequence_length=seq_length,
             num_layers=num_layers,
             device=device,
+            binary_group_flags=binary_group_flags,
         ).to(device)
         
         optimizer_opt = Adam(model_opt.parameters(), lr=learning_rate)
         
-        # Train with fewer epochs for hyperparameter search
+        # Scheduler: let Optuna decide whether to use one
+        use_scheduler = trial.suggest_categorical("use_scheduler", [True, False])
+        scheduler_opt = None
+        if use_scheduler:
+            scheduler_patience = trial.suggest_int("scheduler_patience", 3, 10)
+            scheduler_factor = trial.suggest_float("scheduler_factor", 0.1, 0.5)
+            scheduler_opt = ReduceLROnPlateau(optimizer_opt, 'min',
+                                              patience=scheduler_patience,
+                                              factor=scheduler_factor)
+
+        # Bind kl_weight so training and evaluation use the trial's value
+        loss_fn = partial(loss_function_grouped, kl_weight=kl_weight)
+
+        # Train with enough epochs to match final training dynamics
         try:
             train_losses, val_losses, best_val_loss = train_model_for_optuna(
                 model_opt, train_loader_opt, val_loader_opt, 
-                optimizer_opt, loss_function_grouped, 
-                num_epochs=30, device=device, trial=trial
+                optimizer_opt, loss_fn, 
+                num_epochs=256, device=device, trial=trial,
+                scheduler=scheduler_opt
             )
         except optuna.exceptions.TrialPruned:
             raise
@@ -223,7 +253,9 @@ def create_optuna_objective(encoder_groups, data_groups_train, data_groups_test,
         # Evaluate on test set with the suggested threshold
         f1, _ = evaluate_for_optuna(
             model_opt, test_loader_opt, device, 
-            percentile_threshold, true_anomalies, seq_length
+            percentile_threshold, true_anomalies, seq_length,
+            kl_weight=kl_weight,
+            baseline_loader=val_loader_opt if use_ecdf else None
         )
         
         del model_opt

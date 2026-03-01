@@ -8,6 +8,7 @@ Refactored to work with SMD (Server Machine Dataset) for anomaly detection.
 """
 
 import os
+from functools import partial
 import numpy as np
 import torch
 from torch.optim import Adam
@@ -19,7 +20,7 @@ from sklearn.model_selection import train_test_split
 from config import (
     SMD_DRIVE, MACHINE,
     SEQUENCE_LENGTH, INPUT_DIM, HIDDEN_DIM, LATENT_DIM, NUM_LAYERS,
-    BATCH_SIZE, NUM_EPOCHS, USE_OPTUNA, N_OPTUNA_TRIALS, DEFAULT_PARAMS, DEVICE,
+    BATCH_SIZE, NUM_EPOCHS, USE_OPTUNA, N_OPTUNA_TRIALS, DEFAULT_PARAMS_SMD, DEVICE,
     CUDNN_BENCHMARK, USE_AMP, USE_TORCH_COMPILE, DATALOADER_WORKERS, PIN_MEMORY
 )
 from data_loader import (
@@ -109,7 +110,8 @@ def main(seed=0):
         # Create objective function with data context
         objective_fn = create_optuna_objective(
             encoder_groups, data_groups_train, data_groups_test,
-            true_anomalies, device
+            true_anomalies, device,
+            use_ecdf=False
         )
         
         # Extract machine name without extension for study naming
@@ -126,7 +128,7 @@ def main(seed=0):
             best_params['kl_weight'] = 0.1
         print("\nUsing optimized hyperparameters for final training...")
     else:
-        best_params = DEFAULT_PARAMS.copy()
+        best_params = DEFAULT_PARAMS_SMD.copy()
         print("Using default hyperparameters...")
     
     print("\nFinal training parameters:")
@@ -167,13 +169,23 @@ def main(seed=0):
         model = torch.compile(model)
     
     optimizer = Adam(model.parameters(), lr=final_learning_rate)
-    scheduler = ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.1)
     
+    if best_params.get('use_scheduler', False):
+        scheduler = ReduceLROnPlateau(
+            optimizer, 'min',
+            patience=best_params.get('scheduler_patience', 5),
+            factor=best_params.get('scheduler_factor', 0.1))
+    else:
+        scheduler = None
+    
+    kl_weight = best_params.get('kl_weight', 0.1)
+    loss_fn = partial(loss_function_grouped, kl_weight=kl_weight)
+
     print(f"\nTraining final model with {len(encoder_groups)} encoder groups...")
     
     train_losses, val_losses = train_model_grouped(
         model, train_loader_final, val_loader_final,
-        optimizer, loss_function_grouped, scheduler,
+        optimizer, loss_fn, scheduler,
         num_epochs=NUM_EPOCHS, device=device, use_amp=USE_AMP
     )
     
@@ -187,7 +199,8 @@ def main(seed=0):
     print("\n--- Evaluating Final Model ---")
     final_f1, anomaly_scores = evaluate_for_optuna(
         model, test_loader_final, device,
-        final_percentile_threshold, true_anomalies, sequence_length
+        final_percentile_threshold, true_anomalies, sequence_length,
+        kl_weight=kl_weight
     )
     
     threshold_value = np.percentile(anomaly_scores, final_percentile_threshold)
@@ -198,6 +211,22 @@ def main(seed=0):
         anomaly_scores, anomalies, true_anomalies, sequence_length,
         final_percentile_threshold
     )
+    
+    # Threshold sweep to find optimal percentile
+    adjusted_true = true_anomalies[sequence_length-1:]
+    print("\n--- Threshold Sweep ---")
+    best_sweep_f1, best_sweep_pct = 0, 0
+    for pct in range(85, 100):
+        thr = np.percentile(anomaly_scores, pct)
+        preds = np.array([1 if s > thr else 0 for s in anomaly_scores[:len(adjusted_true)]])
+        from sklearn.metrics import f1_score as f1_fn
+        sweep_f1 = f1_fn(adjusted_true, preds, zero_division=0)
+        n_det = int(preds.sum())
+        if sweep_f1 > best_sweep_f1:
+            best_sweep_f1 = sweep_f1
+            best_sweep_pct = pct
+        print(f"  Percentile {pct}: threshold={thr:.4f}, detections={n_det}, F1={sweep_f1:.4f}")
+    print(f"  Best: percentile={best_sweep_pct}, F1={best_sweep_f1:.4f}")
     
     # Visualize Optuna results if optimization was run
     if USE_OPTUNA and 'study' in dir():
