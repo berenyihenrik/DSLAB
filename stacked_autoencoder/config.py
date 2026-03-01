@@ -64,19 +64,20 @@ PIN_MEMORY = False
 
 # Optuna settings
 USE_OPTUNA = False
-N_OPTUNA_TRIALS = 50
+N_OPTUNA_TRIALS = 20
 
 DEFAULT_PARAMS_SMD = { # For SMD
     'hidden_dim': 256,
-    'latent_dim': 32,
+    'latent_dim': 13,
     'num_layers': 2,
-    'learning_rate': 0.00242243676,
-    'batch_size': 512,
-    'percentile_threshold': 89,
-    'kl_weight': 0.06450689704528334,
-    'use_scheduler': True,
-    'scheduler_patience': 5,
-    'scheduler_factor': 0.1
+    'learning_rate': 0.0020434554984161395,
+    'batch_size': 896,
+    'percentile_threshold': 90,
+    'kl_weight': 0.005109860554090236,
+    'use_scheduler': False,
+    'corr_threshold': 0.8239571182457097,
+    'importance_percentile': 80,
+    'use_lag_penalty': False,
 }
 
 DEFAULT_PARAMS = { # For SMAP

@@ -150,13 +150,41 @@ def compute_anomaly_scores_grouped(model, test_loader, device, baseline_ecdfs=No
     return anomaly_scores
 
 
+def compute_threshold_from_baseline(model, baseline_loader, device, percentile_threshold,
+                                    baseline_ecdfs=None):
+    """Derive an anomaly-score threshold from a **normal** (validation) loader.
+
+    The threshold is set at the *percentile_threshold*-th percentile of the
+    anomaly-score distribution computed over normal data.  This avoids any
+    dependence on the test set.
+
+    Args:
+        model: Trained LSTMVAE_Grouped model.
+        baseline_loader: DataLoader over normal (training/validation) data.
+        device: torch device.
+        percentile_threshold: Percentile (0–100) of the validation score
+                              distribution above which a sample is flagged.
+        baseline_ecdfs: Optional ECDF arrays (from :func:`fit_group_ecdf`)
+                        for calibrated scoring.
+
+    Returns:
+        threshold: float — absolute anomaly-score cutoff.
+        val_scores: list[float] — anomaly scores on the baseline data.
+    """
+    val_scores = compute_anomaly_scores_grouped(
+        model, baseline_loader, device, baseline_ecdfs=baseline_ecdfs)
+    threshold = np.percentile(val_scores, percentile_threshold)
+    return threshold, val_scores
+
+
 def evaluate_lstm_grouped(model, test_loader, device, percentile_threshold=90,
-                          baseline_ecdfs=None):
+                          baseline_ecdfs=None, baseline_loader=None):
     """
     Evaluate the grouped LSTM VAE model and return anomaly indices.
     
-    When ``baseline_ecdfs`` is provided, uses calibrated two-sided ECDF
-    scoring (see :func:`compute_anomaly_scores_grouped`).
+    When ``baseline_loader`` is provided the threshold is derived from
+    the **validation** score distribution (no test-data leakage).
+    Otherwise falls back to thresholding on the test scores themselves.
 
     Args:
         model: Trained LSTMVAE_Grouped model
@@ -164,6 +192,8 @@ def evaluate_lstm_grouped(model, test_loader, device, percentile_threshold=90,
         device: Device
         percentile_threshold: Percentile threshold for anomaly detection
         baseline_ecdfs: Optional calibration from :func:`fit_group_ecdf`.
+        baseline_loader: Optional DataLoader over normal data for threshold
+                         calibration.  Recommended to avoid test leakage.
     
     Returns:
         anomaly_indices: List of indices classified as anomalies
@@ -172,7 +202,13 @@ def evaluate_lstm_grouped(model, test_loader, device, percentile_threshold=90,
     anomaly_scores = compute_anomaly_scores_grouped(
         model, test_loader, device, baseline_ecdfs=baseline_ecdfs)
 
-    threshold = np.percentile(anomaly_scores, percentile_threshold)
+    if baseline_loader is not None:
+        threshold, _ = compute_threshold_from_baseline(
+            model, baseline_loader, device, percentile_threshold,
+            baseline_ecdfs=baseline_ecdfs)
+    else:
+        threshold = np.percentile(anomaly_scores, percentile_threshold)
+
     anomaly_indices = [i for i, score in enumerate(anomaly_scores) if score > threshold]
     return anomaly_indices, anomaly_scores
 

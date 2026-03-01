@@ -78,25 +78,6 @@ def main(seed=0):
     print(f"Using device: {device}")
     print(f"Number of features: {metric_tensor.shape[1]}")
     
-    # Perform feature selection (grouped, on training data only)
-    encoder_groups, dropped_feature_indices = perform_feature_selection(
-        metric_tensor, metric_tensor.shape[1], sequence_length, device
-    )
-    
-    print(f"\nEncoder groups: {len(encoder_groups)}")
-    for i, group in enumerate(encoder_groups):
-        print(f"  Group {i}: {len(group)} features")
-    if dropped_feature_indices:
-        print(f"  Dropped features: {len(dropped_feature_indices)}")
-    
-    # Split features by groups
-    data_groups_train = split_features_by_groups(metric_tensor, encoder_groups)
-    data_groups_test = split_features_by_groups(metric_test_tensor, encoder_groups)
-    
-    # Create grouped sequences
-    sequences_grouped = create_grouped_sequences(data_groups_train, sequence_length)
-    test_sequences_grouped = create_grouped_sequences(data_groups_test, sequence_length)
-    
     # DataLoader kwargs
     num_workers = min(DATALOADER_WORKERS, max(0, (os.cpu_count() or 2) // 2))
     loader_kwargs = {
@@ -107,11 +88,15 @@ def main(seed=0):
     
     # Optuna hyperparameter tuning or use defaults
     if USE_OPTUNA:
-        # Create objective function with data context
+        # Feature selection params (corr_threshold, importance_percentile,
+        # lag_penalty_lambda) are tuned inside each Optuna trial.
         objective_fn = create_optuna_objective(
-            encoder_groups, data_groups_train, data_groups_test,
-            true_anomalies, device,
-            use_ecdf=False
+            encoder_groups=None, data_groups_train=None,
+            data_groups_test=None,
+            true_anomalies=true_anomalies, device=device,
+            raw_train_data=metric_tensor,
+            raw_test_data=metric_test_tensor,
+            sequence_length=sequence_length,
         )
         
         # Extract machine name without extension for study naming
@@ -130,6 +115,26 @@ def main(seed=0):
     else:
         best_params = DEFAULT_PARAMS_SMD.copy()
         print("Using default hyperparameters...")
+    
+    # Feature selection with tuned or default params
+    fs_lambda = (best_params.get('lag_penalty_lambda')
+                 if best_params.get('use_lag_penalty', False) else None)
+    encoder_groups, dropped_feature_indices = perform_feature_selection(
+        metric_tensor, metric_tensor.shape[1], sequence_length, device,
+        corr_threshold=best_params.get('corr_threshold', 0.9),
+        importance_percentile=best_params.get('importance_percentile', 50),
+        lag_penalty_lambda=fs_lambda,
+    )
+    
+    print(f"\nEncoder groups: {len(encoder_groups)}")
+    for i, group in enumerate(encoder_groups):
+        print(f"  Group {i}: {len(group)} features")
+    if dropped_feature_indices:
+        print(f"  Dropped features: {len(dropped_feature_indices)}")
+    
+    # Split features by groups
+    data_groups_train = split_features_by_groups(metric_tensor, encoder_groups)
+    data_groups_test = split_features_by_groups(metric_test_tensor, encoder_groups)
     
     print("\nFinal training parameters:")
     for key, value in best_params.items():
@@ -195,12 +200,13 @@ def main(seed=0):
     save_model(model, model_name, INPUT_DIM, final_latent_dim, final_hidden_dim)
     print(f"\nOptimized model saved as: {model_name}.pth")
     
-    # Evaluate the model
+    # Evaluate the model (legacy weighted-mean scoring, threshold from test scores)
     print("\n--- Evaluating Final Model ---")
     final_f1, anomaly_scores = evaluate_for_optuna(
         model, test_loader_final, device,
         final_percentile_threshold, true_anomalies, sequence_length,
-        kl_weight=kl_weight
+        kl_weight=kl_weight,
+        baseline_loader=None
     )
     
     threshold_value = np.percentile(anomaly_scores, final_percentile_threshold)
@@ -212,7 +218,7 @@ def main(seed=0):
         final_percentile_threshold
     )
     
-    # Threshold sweep to find optimal percentile
+    # Threshold sweep on test scores
     adjusted_true = true_anomalies[sequence_length-1:]
     print("\n--- Threshold Sweep ---")
     best_sweep_f1, best_sweep_pct = 0, 0
