@@ -117,8 +117,7 @@ def main(seed=0):
         print("Using default hyperparameters...")
     
     # Feature selection with tuned or default params
-    fs_lambda = (best_params.get('lag_penalty_lambda')
-                 if best_params.get('use_lag_penalty', False) else None)
+    fs_lambda = best_params.get('lag_penalty_lambda')
     encoder_groups, dropped_feature_indices = perform_feature_selection(
         metric_tensor, metric_tensor.shape[1], sequence_length, device,
         corr_threshold=best_params.get('corr_threshold', 0.9),
