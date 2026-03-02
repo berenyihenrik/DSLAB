@@ -77,7 +77,7 @@ DEFAULT_PARAMS_SMD = { # For SMD
     'use_scheduler': False,
     'corr_threshold': 0.8239571182457097,
     'importance_percentile': 80,
-    'use_lag_penalty': False,
+    'lag_penalty_lambda': 0,
 }
 
 DEFAULT_PARAMS = { # For SMAP

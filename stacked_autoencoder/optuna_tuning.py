@@ -206,11 +206,7 @@ def create_optuna_objective(encoder_groups, data_groups_train, data_groups_test,
             corr_threshold = trial.suggest_float("corr_threshold", 0.80, 0.97)
             importance_percentile = trial.suggest_int(
                 "importance_percentile", 30, 90, step=10)
-            use_lag_penalty = trial.suggest_categorical(
-                "use_lag_penalty", [True, False])
-            lag_penalty_lambda = (
-                trial.suggest_float("lag_penalty_lambda", 3.0, 30.0)
-                if use_lag_penalty else None)
+            lag_penalty_lambda = trial.suggest_float("lag_penalty_lambda", 3.0, 30.0)
 
             trial_groups, _ = perform_feature_selection(
                 raw_train_data, raw_train_data.shape[1], seq_length, device,
