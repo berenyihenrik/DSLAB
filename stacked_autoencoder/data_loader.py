@@ -167,6 +167,42 @@ def get_available_machines(drive_path):
 # Common Preprocessing Functions
 # =============================================================================
 
+def detect_binary_features(data):
+    """Detect features with ≤2 unique values (two-valued / binary features).
+
+    This includes true {0,1} binary features as well as two-valued features on
+    other intervals (e.g. {-1, 1}, {0, 100}). All of these are semantically
+    discrete state switches and should be handled with BCE loss after
+    normalizing to [0, 1] via normalize_binary_features().
+
+    Args:
+        data: numpy array of shape (timesteps, features)
+
+    Returns:
+        binary_indices: set of feature indices that are two-valued
+    """
+    binary_indices = set()
+    for i in range(data.shape[1]):
+        if len(np.unique(data[:, i])) <= 2:
+            binary_indices.add(i)
+    return binary_indices
+
+
+def normalize_binary_features(train_data, test_data, binary_indices):
+    """Remap binary features to [0, 1] for BCE loss compatibility.
+
+    Uses min/max from training data to normalize both datasets.
+    Features already in {0, 1} are unaffected.
+    """
+    for idx in binary_indices:
+        col_min = train_data[:, idx].min()
+        col_max = train_data[:, idx].max()
+        if col_max > col_min:
+            train_data[:, idx] = (train_data[:, idx] - col_min) / (col_max - col_min)
+            test_data[:, idx] = (test_data[:, idx] - col_min) / (col_max - col_min)
+    return train_data, test_data
+
+
 def preprocess_data(data):
     """
     Handle NaN values in data by interpolation and filling.

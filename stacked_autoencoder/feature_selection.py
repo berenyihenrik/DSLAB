@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Four-stage unsupervised feature selection on training data only.
 
-Stage 0: Drop static features (std == 0 or IQR == 0).
+Stage 0: Drop static features (std == 0).
 Stage 1: Redundancy clustering via lagged Spearman correlation + agglomerative clustering.
 Stage 2: AE masking importance — train a small LSTM-AE on cluster representatives,
          then measure per-feature reconstruction loss increase under block permutation.
@@ -16,6 +16,11 @@ from scipy.stats import spearmanr
 from scipy.cluster.hierarchy import linkage, fcluster
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, TensorDataset
+
+# Module-level cache: (max_lag, lag_penalty_lambda) -> similarity matrix.
+# Avoids recomputing the expensive lagged Spearman matrix across Optuna trials
+# that share the same training data and lag settings.
+_similarity_cache: dict = {}
 
 
 # ---------------------------------------------------------------------------
@@ -47,29 +52,53 @@ class _SmallLSTMAE(nn.Module):
 # ---------------------------------------------------------------------------
 
 def _drop_static_features(train_data):
-    """Drop features with std == 0 or IQR == 0 (constant/near-constant).
+    """Handle static features (std == 0).
+
+    Static binary features (≤2 unique values) are kept — they may only
+    flip during anomalies and serve as strong detectors.  Static
+    continuous features are dropped as uninformative.
 
     Args:
         train_data: array of shape (timesteps, n_features)
 
     Returns:
-        kept_feature_indices: 1-D array of kept original feature indices
-        dropped_feature_indices: 1-D array of dropped original feature indices
+        kept_feature_indices: 1-D array of non-static original feature indices
+        dropped_feature_indices: 1-D array of dropped (static continuous) feature indices
+        static_binary_indices: 1-D array of static binary feature indices (kept separately)
     """
     n_features = train_data.shape[1]
     stds = np.std(train_data, axis=0)
-    iqrs = np.subtract(*np.percentile(train_data, [75, 25], axis=0))
 
-    is_static = (stds == 0) | (iqrs == 0)
+    is_static = stds == 0
+    static_indices = np.where(is_static)[0]
+
+    # Classify static features as binary vs continuous.
+    # A static feature is "binary-safe" only if its values are in {0, 1},
+    # so BCE loss can be used safely at eval time.
+    static_binary = []
+    static_continuous = []
+    for idx in static_indices:
+        unique_vals = np.unique(train_data[:, idx])
+        if len(unique_vals) <= 2 and all(v in (0.0, 1.0) for v in unique_vals):
+            static_binary.append(idx)
+        else:
+            static_continuous.append(idx)
+
+    static_binary = np.array(static_binary, dtype=int)
+    dropped = np.array(static_continuous, dtype=int)
     kept = np.where(~is_static)[0]
-    dropped = np.where(is_static)[0]
 
-    print("Stage 0 — Drop static features:")
-    print(f"  {n_features} total features, {len(dropped)} static (std==0 or IQR==0), {len(kept)} kept")
+    print("Stage 0 — Handle static features:")
+    print(f"  {n_features} total features, {len(static_indices)} static (std==0)")
+    print(f"  {len(kept)} dynamic (kept for clustering)")
+    print(f"  {len(static_binary)} static binary (kept as sentinel group)")
+    print(f"  {len(dropped)} static continuous (dropped)")
+    if len(static_binary) > 0:
+        print(f"  Static binary indices: {static_binary.tolist()}")
     if len(dropped) > 0:
-        print(f"  Dropped feature indices: {dropped.tolist()}")
+        print(f"  Dropped indices: {dropped.tolist()}")
 
-    return kept, dropped
+    return kept, dropped, static_binary
 
 
 # ---------------------------------------------------------------------------
@@ -159,10 +188,14 @@ def _compute_redundancy_clusters(train_data, corr_threshold=0.9, max_lag=30,
     """
     n_features = train_data.shape[1]
 
-    # Lagged Spearman similarity matrix
-    similarity = _compute_lagged_spearman_similarity(
-        train_data, max_lag, lag_penalty_lambda
-    )
+    # Lagged Spearman similarity matrix — cache per (shape, max_lag, lambda)
+    # so repeated Optuna trials with the same data and lag settings skip this step.
+    cache_key = (train_data.shape, max_lag, lag_penalty_lambda)
+    if cache_key not in _similarity_cache:
+        _similarity_cache[cache_key] = _compute_lagged_spearman_similarity(
+            train_data, max_lag, lag_penalty_lambda
+        )
+    similarity = _similarity_cache[cache_key]
 
     # Distance = 1 - similarity
     dist_matrix = 1.0 - similarity
@@ -228,7 +261,7 @@ def _compute_masking_importance(
     sequence_length,
     device,
     hidden_dim=64,
-    num_epochs=30,
+    num_epochs=15,
     batch_size=64,
     n_repeats=3,
 ):
@@ -337,7 +370,7 @@ def perform_feature_selection(train_data, n_features, sequence_length, device,
                               lag_penalty_lambda=None):
     """Four-stage unsupervised feature selection on training data only.
 
-    Stage 0: Drop static features (std == 0 or IQR == 0).
+    Stage 0: Drop static features (std == 0).
     Stage 1: Lagged Spearman correlation clustering → group redundant features.
     Stage 2: LSTM-AE masking importance → score cluster representatives.
     Stage 3: Group-aware encoder assignment → build encoder groups.
@@ -349,7 +382,7 @@ def perform_feature_selection(train_data, n_features, sequence_length, device,
         device: torch device (for AE training)
         corr_threshold: |correlation| above which features are clustered together.
             Note: lagged correlation inflates similarities vs lag-0; consider
-            increasing to 0.92–0.95 when using the default lagged method.
+            increasing to 0.92-0.95 when using the default lagged method.
         importance_percentile: Percentile cutoff for importance scores; clusters
             with representative importance >= this percentile get their own
             encoder group.  Lower clusters are merged into a catch-all group.
@@ -362,70 +395,81 @@ def perform_feature_selection(train_data, n_features, sequence_length, device,
                         Last group is the catch-all "remaining" group (if non-empty).
         dropped_feature_indices: list[int] — static features that were dropped
     """
-    # Stage 0: drop static features
-    kept_indices, dropped_indices = _drop_static_features(train_data)
+    # Stage 0: handle static features
+    kept_indices, dropped_indices, static_binary_indices = _drop_static_features(train_data)
     dropped_feature_indices = dropped_indices.tolist()
 
-    if len(kept_indices) == 0:
-        print("Warning: All features are static. No encoder groups created.")
+    if len(kept_indices) == 0 and len(static_binary_indices) == 0:
+        print("Warning: All features are static continuous. No encoder groups created.")
         return [], dropped_feature_indices
 
-    kept_data = train_data[:, kept_indices]
+    # Stages 1-3 operate on dynamic (non-static) features only
+    if len(kept_indices) > 0:
+        kept_data = train_data[:, kept_indices]
 
-    # Stage 1: redundancy clustering (on kept features only)
-    representative_local, cluster_labels, cluster_members_dict, cluster_rep_dict = \
-        _compute_redundancy_clusters(kept_data, corr_threshold,
-                                     max_lag=sequence_length,
-                                     lag_penalty_lambda=lag_penalty_lambda)
+        # Stage 1: redundancy clustering (on kept features only)
+        representative_local, cluster_labels, cluster_members_dict, cluster_rep_dict = \
+            _compute_redundancy_clusters(kept_data, corr_threshold,
+                                         max_lag=sequence_length,
+                                         lag_penalty_lambda=lag_penalty_lambda)
 
-    # Stage 2: AE masking importance on representatives
-    importance_scores = _compute_masking_importance(
-        kept_data, representative_local, sequence_length, device
-    )
+        # Stage 2: AE masking importance on representatives
+        importance_scores = _compute_masking_importance(
+            kept_data, representative_local, sequence_length, device
+        )
 
-    # Build mapping: representative local index → importance score
-    rep_to_importance = {}
-    for i, rep_local in enumerate(representative_local):
-        rep_to_importance[rep_local] = importance_scores[i]
+        # Build mapping: representative local index → importance score
+        rep_to_importance = {}
+        for i, rep_local in enumerate(representative_local):
+            rep_to_importance[rep_local] = importance_scores[i]
 
-    # Map each cluster to its representative's importance score
-    cluster_importance = {}
-    cluster_representative = {}
-    for cid in cluster_members_dict:
-        rep = cluster_rep_dict[cid]
-        cluster_representative[cid] = rep
-        cluster_importance[cid] = rep_to_importance[rep]
+        # Map each cluster to its representative's importance score
+        cluster_importance = {}
+        cluster_representative = {}
+        for cid in cluster_members_dict:
+            rep = cluster_rep_dict[cid]
+            cluster_representative[cid] = rep
+            cluster_importance[cid] = rep_to_importance[rep]
 
-    # Stage 3: group-aware encoder assignment
-    scores = np.array(list(cluster_importance.values()))
-    cids = list(cluster_importance.keys())
-    threshold = np.percentile(scores, importance_percentile)
+        # Stage 3: group-aware encoder assignment
+        scores = np.array(list(cluster_importance.values()))
+        cids = list(cluster_importance.keys())
+        threshold = np.percentile(scores, importance_percentile)
 
-    high_clusters = []  # (cid, importance) pairs for clusters above threshold
-    low_clusters = []
-    for cid in cids:
-        if cluster_importance[cid] >= threshold:
-            high_clusters.append((cid, cluster_importance[cid]))
-        else:
-            low_clusters.append((cid, cluster_importance[cid]))
+        high_clusters = []  # (cid, importance) pairs for clusters above threshold
+        low_clusters = []
+        for cid in cids:
+            if cluster_importance[cid] >= threshold:
+                high_clusters.append((cid, cluster_importance[cid]))
+            else:
+                low_clusters.append((cid, cluster_importance[cid]))
 
-    # Sort high-importance clusters by descending importance
-    high_clusters.sort(key=lambda x: x[1], reverse=True)
+        # Sort high-importance clusters by descending importance
+        high_clusters.sort(key=lambda x: x[1], reverse=True)
 
-    encoder_groups = []
-    # Each high-importance cluster becomes its own encoder group (original indices)
-    for cid, imp in high_clusters:
-        local_members = cluster_members_dict[cid]
-        original_members = sorted(kept_indices[m] for m in local_members)
-        encoder_groups.append(original_members)
+        encoder_groups = []
+        # Each high-importance cluster becomes its own encoder group (original indices)
+        for cid, imp in high_clusters:
+            local_members = cluster_members_dict[cid]
+            original_members = sorted(kept_indices[m] for m in local_members)
+            encoder_groups.append(original_members)
 
-    # Merge all low-importance clusters into one catch-all group
-    catch_all = []
-    for cid, imp in low_clusters:
-        local_members = cluster_members_dict[cid]
-        catch_all.extend(kept_indices[m] for m in local_members)
-    if catch_all:
-        encoder_groups.append(sorted(catch_all))
+        # Merge all low-importance clusters into one catch-all group
+        catch_all = []
+        for cid, imp in low_clusters:
+            local_members = cluster_members_dict[cid]
+            catch_all.extend(kept_indices[m] for m in local_members)
+        if catch_all:
+            encoder_groups.append(sorted(catch_all))
+    else:
+        encoder_groups = []
+        catch_all = []
+        high_clusters = []
+        low_clusters = []
+
+    # Append static binary features as a dedicated sentinel group
+    if len(static_binary_indices) > 0:
+        encoder_groups.append(sorted(static_binary_indices.tolist()))
 
     # --- Assertions ---
     all_assigned = set()
@@ -434,26 +478,36 @@ def perform_feature_selection(train_data, n_features, sequence_length, device,
         assert len(group_set & all_assigned) == 0, \
             f"Encoder groups are not disjoint! Overlap: {group_set & all_assigned}"
         all_assigned |= group_set
-    assert all_assigned == set(kept_indices.tolist()), \
-        (f"Union of encoder groups != kept features.\n"
-         f"  Missing: {set(kept_indices.tolist()) - all_assigned}\n"
-         f"  Extra:   {all_assigned - set(kept_indices.tolist())}")
+    expected = set(kept_indices.tolist()) | set(static_binary_indices.tolist())
+    assert all_assigned == expected, \
+        (f"Union of encoder groups != kept + static binary features.\n"
+         f"  Missing: {expected - all_assigned}\n"
+         f"  Extra:   {all_assigned - expected}")
 
     # --- Logging ---
     n_high = len(high_clusters)
     n_low = len(low_clusters)
     has_catchall = len(catch_all) > 0
+    has_sentinel = len(static_binary_indices) > 0
 
     print(f"\nStage 3 — Group-aware encoder assignment:")
-    print(f"  Importance threshold (percentile {importance_percentile}): {threshold:.6f}")
-    print(f"  {n_high} high-importance cluster(s) → {n_high} individual encoder group(s)")
-    print(f"  {n_low} low-importance cluster(s) → {'1 catch-all group' if has_catchall else 'no catch-all group (empty)'}")
+    if len(kept_indices) > 0:
+        print(f"  Importance threshold (percentile {importance_percentile}): {threshold:.6f}")
+        print(f"  {n_high} high-importance cluster(s) → {n_high} individual encoder group(s)")
+        print(f"  {n_low} low-importance cluster(s) → {'1 catch-all group' if has_catchall else 'no catch-all group (empty)'}")
+    if has_sentinel:
+        print(f"  1 static-binary sentinel group ({len(static_binary_indices)} features)")
     print(f"  Total encoder groups: {len(encoder_groups)}")
     for i, group in enumerate(encoder_groups):
-        label = "catch-all" if (has_catchall and i == len(encoder_groups) - 1) else f"important #{i+1}"
+        if has_sentinel and i == len(encoder_groups) - 1:
+            label = "static-binary sentinel"
+        elif has_catchall and i == len(encoder_groups) - (2 if has_sentinel else 1):
+            label = "catch-all"
+        else:
+            label = f"important #{i+1}"
         print(f"    Group {i} ({label}): {len(group)} features → {group}")
 
-    print(f"\n  Dropped static features ({len(dropped_feature_indices)}): {dropped_feature_indices}")
+    print(f"\n  Dropped static continuous features ({len(dropped_feature_indices)}): {dropped_feature_indices}")
 
     return encoder_groups, dropped_feature_indices
 

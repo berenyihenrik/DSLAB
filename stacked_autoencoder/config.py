@@ -8,12 +8,12 @@ import torch
 # SMAP/MSL Dataset Configuration
 # =============================================================================
 # DATASET_TYPE can be "SMAP" or "MSL"
-DATASET_TYPE = "MSL"  # Change to "MSL" for Mars Science Laboratory dataset
+DATASET_TYPE = "SMAP"  # Change to "MSL" for Mars Science Laboratory dataset
 SMAP_DRIVE = "/mnt/c/Users/beren/Desktop/DSLAB/datasets/SMAP_MSL/"
 
 # Available channels for SMAP and MSL (from labeled_anomalies.csv)
 # You can change CHANNEL to any valid channel ID
-CHANNEL = "M-1"  # Example: P-1, S-1, E-1, etc. for SMAP; M-1, C-1, T-4, etc. for MSL
+CHANNEL = "E-1"  # Example: P-1, S-1, E-1, etc. for SMAP; M-1, C-1, T-4, etc. for MSL
 
 # Paths for SMAP/MSL dataset
 SMAP_TRAIN_DATASET = os.path.join(SMAP_DRIVE, "data/data", "train", f"{CHANNEL}.npy")
@@ -64,17 +64,33 @@ PIN_MEMORY = False
 
 # Optuna settings
 USE_OPTUNA = False
-N_OPTUNA_TRIALS = 50
+N_OPTUNA_TRIALS = 20
 
-# Default hyperparameters (used when not using Optuna)
-DEFAULT_PARAMS = { # For SMD
+DEFAULT_PARAMS_SMD = { # For SMD
     'hidden_dim': 256,
-    'latent_dim': 32,
+    'latent_dim': 13,
     'num_layers': 2,
-    'learning_rate': 0.00242243676, # 7.570114875046537e-05, - for batch size 16
-    'batch_size': 512,
-    'percentile_threshold': 93,
-    'kl_weight': 0.06450689704528334
+    'learning_rate': 0.0020434554984161395,
+    'batch_size': 896,
+    'percentile_threshold': 90,
+    'kl_weight': 0.005109860554090236,
+    'use_scheduler': False,
+    'corr_threshold': 0.8239571182457097,
+    'importance_percentile': 80,
+    'lag_penalty_lambda': 0,
+}
+
+DEFAULT_PARAMS = { # For SMAP
+    'hidden_dim': 96,
+    'latent_dim': 13,
+    'num_layers': 2,
+    'learning_rate': 0.0016434424020119224,
+    'batch_size': 640,
+    'percentile_threshold': 94,
+    'kl_weight': 0.0067481364876198595,
+    'use_scheduler': False,
+    'scheduler_patience': 5,
+    'scheduler_factor': 0.1
 }
 
 # Device configuration
