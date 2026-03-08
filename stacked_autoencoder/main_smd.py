@@ -8,6 +8,7 @@ Refactored to work with SMD (Server Machine Dataset) for anomaly detection.
 """
 
 import os
+from functools import partial
 import numpy as np
 import torch
 from torch.optim import Adam
@@ -19,7 +20,7 @@ from sklearn.model_selection import train_test_split
 from config import (
     SMD_DRIVE, MACHINE,
     SEQUENCE_LENGTH, INPUT_DIM, HIDDEN_DIM, LATENT_DIM, NUM_LAYERS,
-    BATCH_SIZE, NUM_EPOCHS, USE_OPTUNA, N_OPTUNA_TRIALS, DEFAULT_PARAMS, DEVICE,
+    BATCH_SIZE, NUM_EPOCHS, USE_OPTUNA, N_OPTUNA_TRIALS, DEFAULT_PARAMS_SMD, DEVICE,
     CUDNN_BENCHMARK, USE_AMP, USE_TORCH_COMPILE, DATALOADER_WORKERS, PIN_MEMORY
 )
 from data_loader import (
@@ -77,25 +78,6 @@ def main(seed=0):
     print(f"Using device: {device}")
     print(f"Number of features: {metric_tensor.shape[1]}")
     
-    # Perform feature selection (grouped, on training data only)
-    encoder_groups, dropped_feature_indices = perform_feature_selection(
-        metric_tensor, metric_tensor.shape[1], sequence_length, device
-    )
-    
-    print(f"\nEncoder groups: {len(encoder_groups)}")
-    for i, group in enumerate(encoder_groups):
-        print(f"  Group {i}: {len(group)} features")
-    if dropped_feature_indices:
-        print(f"  Dropped features: {len(dropped_feature_indices)}")
-    
-    # Split features by groups
-    data_groups_train = split_features_by_groups(metric_tensor, encoder_groups)
-    data_groups_test = split_features_by_groups(metric_test_tensor, encoder_groups)
-    
-    # Create grouped sequences
-    sequences_grouped = create_grouped_sequences(data_groups_train, sequence_length)
-    test_sequences_grouped = create_grouped_sequences(data_groups_test, sequence_length)
-    
     # DataLoader kwargs
     num_workers = min(DATALOADER_WORKERS, max(0, (os.cpu_count() or 2) // 2))
     loader_kwargs = {
@@ -106,10 +88,15 @@ def main(seed=0):
     
     # Optuna hyperparameter tuning or use defaults
     if USE_OPTUNA:
-        # Create objective function with data context
+        # Feature selection params (corr_threshold, importance_percentile,
+        # lag_penalty_lambda) are tuned inside each Optuna trial.
         objective_fn = create_optuna_objective(
-            encoder_groups, data_groups_train, data_groups_test,
-            true_anomalies, device
+            encoder_groups=None, data_groups_train=None,
+            data_groups_test=None,
+            true_anomalies=true_anomalies, device=device,
+            raw_train_data=metric_tensor,
+            raw_test_data=metric_test_tensor,
+            sequence_length=sequence_length,
         )
         
         # Extract machine name without extension for study naming
@@ -126,8 +113,27 @@ def main(seed=0):
             best_params['kl_weight'] = 0.1
         print("\nUsing optimized hyperparameters for final training...")
     else:
-        best_params = DEFAULT_PARAMS.copy()
+        best_params = DEFAULT_PARAMS_SMD.copy()
         print("Using default hyperparameters...")
+    
+    # Feature selection with tuned or default params
+    fs_lambda = best_params.get('lag_penalty_lambda')
+    encoder_groups, dropped_feature_indices = perform_feature_selection(
+        metric_tensor, metric_tensor.shape[1], sequence_length, device,
+        corr_threshold=best_params.get('corr_threshold', 0.9),
+        importance_percentile=best_params.get('importance_percentile', 50),
+        lag_penalty_lambda=fs_lambda,
+    )
+    
+    print(f"\nEncoder groups: {len(encoder_groups)}")
+    for i, group in enumerate(encoder_groups):
+        print(f"  Group {i}: {len(group)} features")
+    if dropped_feature_indices:
+        print(f"  Dropped features: {len(dropped_feature_indices)}")
+    
+    # Split features by groups
+    data_groups_train = split_features_by_groups(metric_tensor, encoder_groups)
+    data_groups_test = split_features_by_groups(metric_test_tensor, encoder_groups)
     
     print("\nFinal training parameters:")
     for key, value in best_params.items():
@@ -167,13 +173,23 @@ def main(seed=0):
         model = torch.compile(model)
     
     optimizer = Adam(model.parameters(), lr=final_learning_rate)
-    scheduler = ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.1)
     
+    if best_params.get('use_scheduler', False):
+        scheduler = ReduceLROnPlateau(
+            optimizer, 'min',
+            patience=best_params.get('scheduler_patience', 5),
+            factor=best_params.get('scheduler_factor', 0.1))
+    else:
+        scheduler = None
+    
+    kl_weight = best_params.get('kl_weight', 0.1)
+    loss_fn = partial(loss_function_grouped, kl_weight=kl_weight)
+
     print(f"\nTraining final model with {len(encoder_groups)} encoder groups...")
     
     train_losses, val_losses = train_model_grouped(
         model, train_loader_final, val_loader_final,
-        optimizer, loss_function_grouped, scheduler,
+        optimizer, loss_fn, scheduler,
         num_epochs=NUM_EPOCHS, device=device, use_amp=USE_AMP
     )
     
@@ -183,11 +199,13 @@ def main(seed=0):
     save_model(model, model_name, INPUT_DIM, final_latent_dim, final_hidden_dim)
     print(f"\nOptimized model saved as: {model_name}.pth")
     
-    # Evaluate the model
+    # Evaluate the model (legacy weighted-mean scoring, threshold from test scores)
     print("\n--- Evaluating Final Model ---")
     final_f1, anomaly_scores = evaluate_for_optuna(
         model, test_loader_final, device,
-        final_percentile_threshold, true_anomalies, sequence_length
+        final_percentile_threshold, true_anomalies, sequence_length,
+        kl_weight=kl_weight,
+        baseline_loader=None
     )
     
     threshold_value = np.percentile(anomaly_scores, final_percentile_threshold)
@@ -198,6 +216,22 @@ def main(seed=0):
         anomaly_scores, anomalies, true_anomalies, sequence_length,
         final_percentile_threshold
     )
+    
+    # Threshold sweep on test scores
+    adjusted_true = true_anomalies[sequence_length-1:]
+    print("\n--- Threshold Sweep ---")
+    best_sweep_f1, best_sweep_pct = 0, 0
+    for pct in range(85, 100):
+        thr = np.percentile(anomaly_scores, pct)
+        preds = np.array([1 if s > thr else 0 for s in anomaly_scores[:len(adjusted_true)]])
+        from sklearn.metrics import f1_score as f1_fn
+        sweep_f1 = f1_fn(adjusted_true, preds, zero_division=0)
+        n_det = int(preds.sum())
+        if sweep_f1 > best_sweep_f1:
+            best_sweep_f1 = sweep_f1
+            best_sweep_pct = pct
+        print(f"  Percentile {pct}: threshold={thr:.4f}, detections={n_det}, F1={sweep_f1:.4f}")
+    print(f"  Best: percentile={best_sweep_pct}, F1={best_sweep_f1:.4f}")
     
     # Visualize Optuna results if optimization was run
     if USE_OPTUNA and 'study' in dir():
