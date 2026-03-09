@@ -36,6 +36,15 @@ SMD_TRAIN_DATASET = os.path.join(SMD_DRIVE, "train", MACHINE)
 SMD_TEST_DATASET = os.path.join(SMD_DRIVE, "test", MACHINE)
 SMD_TEST_LABEL_DATASET = os.path.join(SMD_DRIVE, "test_label", MACHINE)
 
+# =============================================================================
+# SWaT (Secure Water Treatment) Configuration
+# =============================================================================
+SWAT_DRIVE = "/mnt/c/Users/beren/Desktop/DSLAB/datasets/swat/"
+SWAT_NORMAL_DATASET = os.path.join(SWAT_DRIVE, "SWaT_Dataset_Normal_v0 1.csv")
+SWAT_ATTACK_DATASET = os.path.join(SWAT_DRIVE, "SWaT_Dataset_Attack_v0 1.csv")
+# Contiguous validation split on normal (train) time series.
+SWAT_VAL_RATIO = 0.2
+
 # Model hyperparameters (defaults)
 SEQUENCE_LENGTH = 30
 INPUT_DIM = 1
@@ -91,6 +100,21 @@ DEFAULT_PARAMS = { # For SMAP
     'use_scheduler': False,
     'scheduler_patience': 5,
     'scheduler_factor': 0.1
+}
+
+DEFAULT_PARAMS_SWAT = {  # For SWaT
+    'hidden_dim': 96,
+    'latent_dim': 16,
+    'num_layers': 2,
+    'learning_rate': 0.001,
+    'batch_size': 1024,
+    'percentile_threshold': 95,
+    'kl_weight': 0.01,
+    'use_scheduler': False,
+    'scheduler_patience': 5,
+    'scheduler_factor': 0.1,
+    'corr_threshold': 0.9,
+    'importance_percentile': 50,
 }
 
 # Device configuration
