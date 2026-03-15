@@ -114,7 +114,7 @@ class LSTMVAE_Grouped(nn.Module):
                                features in that group are binary. Used to select
                                BCE loss instead of MSE for those groups.
             fusion_type: fusion strategy for concatenated latents. One of
-                         "none", "mlp", "attn_mean", "attn_both".
+                         "none", "mlp", "mlp_mean", "attn_mean", "attn_both".
             fusion_dropout: dropout rate for fusion MLP
         """
         super(LSTMVAE_Grouped, self).__init__()
@@ -123,7 +123,7 @@ class LSTMVAE_Grouped(nn.Module):
         self.device = device
         self.n_total_features = sum(len(g) for g in encoder_groups)
         self.binary_group_flags = binary_group_flags
-        valid_fusion_types = {"none", "mlp", "attn_mean", "attn_both"}
+        valid_fusion_types = {"none", "mlp", "mlp_mean", "attn_mean", "attn_both"}
         if fusion_type not in valid_fusion_types:
             raise ValueError(
                 f"fusion_type must be one of {sorted(valid_fusion_types)}, got {fusion_type!r}"
@@ -159,6 +159,8 @@ class LSTMVAE_Grouped(nn.Module):
         if self.fusion_type == "mlp":
             self.mean_fuser = ResidualMLPFusion(decoder_input_dim, dropout=fusion_dropout)
             self.logvar_fuser = ResidualMLPFusion(decoder_input_dim, dropout=fusion_dropout)
+        elif self.fusion_type == "mlp_mean":
+            self.mean_fuser = ResidualMLPFusion(decoder_input_dim, dropout=fusion_dropout)
         elif self.fusion_type == "attn_mean":
             self.mean_fuser = GroupSelfAttentionFusion(
                 n_groups=n_groups,
@@ -205,6 +207,8 @@ class LSTMVAE_Grouped(nn.Module):
         if self.fusion_type == "mlp":
             mean = self.mean_fuser(mean)
             logvar = self.logvar_fuser(logvar)
+        elif self.fusion_type == "mlp_mean":
+            mean = self.mean_fuser(mean)
         elif self.fusion_type == "attn_mean":
             mean = self.mean_fuser(mean)
         elif self.fusion_type == "attn_both":
