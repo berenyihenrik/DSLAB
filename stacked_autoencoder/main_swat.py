@@ -99,7 +99,7 @@ def main(seed=42, num_epochs_override=None):
         continuous_train = train_series[:, continuous_indices]
         # SWaT is large enough that Stage-2 importance can OOM on GPU.
         # Run feature selection on CPU while keeping final model training on DEVICE.
-        fs_device = torch.device("cpu")
+        fs_device = DEVICE
         cont_groups_local, dropped_local = perform_feature_selection(
             continuous_train,
             continuous_train.shape[1],

@@ -15,7 +15,7 @@ import torch.nn as nn
 from scipy.stats import spearmanr
 from scipy.cluster.hierarchy import linkage, fcluster
 from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, Subset
 
 # Module-level cache: (max_lag, lag_penalty_lambda) -> similarity matrix.
 # Avoids recomputing the expensive lagged Spearman matrix across Optuna trials
@@ -45,6 +45,22 @@ class _SmallLSTMAE(nn.Module):
         h_repeated = h.unsqueeze(1).repeat(1, self.sequence_length, 1)
         dec_out, _ = self.decoder(h_repeated)
         return self.output_layer(dec_out)
+
+
+class _WindowDataset(torch.utils.data.Dataset):
+    """Lazy sliding-window dataset that avoids materializing all windows."""
+
+    def __init__(self, data: np.ndarray, seq_len: int):
+        # data: (timesteps, n_features), kept as float32 numpy
+        self.data = data.astype(np.float32, copy=False)
+        self.seq_len = seq_len
+        self.n = data.shape[0] - seq_len + 1
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, idx):
+        return torch.from_numpy(self.data[idx : idx + self.seq_len])
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +271,41 @@ def _block_permute(arr, block_size, rng=None):
     return np.concatenate([blocks[i] for i in perm])
 
 
+@torch.inference_mode()
+def _batched_mse(model, loader, device, corrupt_fn=None):
+    """Compute global MSE over a DataLoader, optionally corrupting each batch.
+
+    Args:
+        model: the trained _SmallLSTMAE in eval mode.
+        loader: DataLoader yielding batches of shape (B, seq_len, n_features).
+        device: torch device for inference.
+        corrupt_fn: optional callable(batch_np) -> batch_np that corrupts
+                    a numpy copy of the batch before inference.
+                    If None, compute clean baseline MSE.
+
+    Returns:
+        Global MSE (float) = total_sse / total_elements.
+    """
+    total_sse = 0.0
+    total_n = 0
+
+    for batch in loader:
+        clean = batch                           # CPU tensor from DataLoader
+        if corrupt_fn is not None:
+            corrupted_np = batch.numpy().copy()  # (B, seq_len, n_features)
+            corrupted_np = corrupt_fn(corrupted_np)
+            inp = torch.from_numpy(corrupted_np).to(device, non_blocking=True)
+        else:
+            inp = clean.to(device, non_blocking=True)
+
+        target = clean.to(device, non_blocking=True)
+        recon = model(inp)
+        total_sse += torch.nn.functional.mse_loss(recon, target, reduction="sum").item()
+        total_n += target.numel()
+
+    return total_sse / total_n
+
+
 def _compute_masking_importance(
     train_data,
     representative_indices,
@@ -281,32 +332,31 @@ def _compute_masking_importance(
     Returns:
         importance_scores: array of shape (len(representative_indices),)
     """
-    # Subset to representative features
+    # --- Subset to representative features + scaling (unchanged) ---
     data = train_data[:, representative_indices].astype(np.float32)
     n_features = data.shape[1]
-
-    # Robust per-feature scaling (median / IQR) so ΔMSE reflects dynamics, not scale
     medians = np.median(data, axis=0)
     q75, q25 = np.percentile(data, [75, 25], axis=0)
     iqrs = q75 - q25
     iqrs[iqrs == 0] = 1.0
     data = (data - medians) / iqrs
 
-    # Create sequences
-    sequences = []
-    for i in range(data.shape[0] - sequence_length + 1):
-        sequences.append(data[i: i + sequence_length])
-    sequences = np.array(sequences)  # (N, seq_len, n_features)
+    # --- Lazy windowed dataset + index-based train/val split ---
+    full_dataset = _WindowDataset(data, sequence_length)
+    indices = np.arange(len(full_dataset))
+    train_idx, val_idx = train_test_split(indices, test_size=0.3, random_state=42)
 
-    # Train / val split
-    train_seq, val_seq = train_test_split(sequences, test_size=0.3, random_state=42)
-    train_tensor = torch.tensor(train_seq, dtype=torch.float32)
-    val_tensor = torch.tensor(val_seq, dtype=torch.float32)
+    train_loader = DataLoader(
+        Subset(full_dataset, train_idx),
+        batch_size=batch_size, shuffle=True,
+    )
+    eval_batch_size = max(batch_size, 512)   # can be larger since no gradients
+    val_loader = DataLoader(
+        Subset(full_dataset, val_idx),
+        batch_size=eval_batch_size, shuffle=False,
+    )
 
-    train_ds = TensorDataset(train_tensor)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-
-    # Build and train small AE
+    # --- Build and train small AE (unchanged logic) ---
     model = _SmallLSTMAE(n_features, hidden_dim, sequence_length).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     criterion = nn.MSELoss()
@@ -315,7 +365,7 @@ def _compute_masking_importance(
     model.train()
     for epoch in range(num_epochs):
         epoch_loss = 0.0
-        for (batch,) in train_loader:
+        for batch in train_loader:
             batch = batch.to(device)
             optimizer.zero_grad()
             recon = model(batch)
@@ -326,32 +376,31 @@ def _compute_masking_importance(
         if (epoch + 1) % 10 == 0 or epoch == 0:
             print(f"  Epoch {epoch+1:3d}/{num_epochs}  loss={epoch_loss / len(train_loader):.6f}")
 
-    # Compute baseline MSE on val set
+    # --- Baseline MSE (batched) ---
     model.eval()
-    val_device = val_tensor.to(device)
-    with torch.no_grad():
-        baseline_recon = model(val_device)
-        baseline_mse = torch.mean((baseline_recon - val_device) ** 2).item()
+    baseline_mse = _batched_mse(model, val_loader, device)
     print(f"  Baseline val MSE: {baseline_mse:.6f}")
 
-    # Per-feature importance via block permutation
+    # --- Per-feature importance via block permutation (batched) ---
     importance_scores = np.zeros(n_features)
     rng = np.random.RandomState(42)
 
     for fi in range(n_features):
         delta_sum = 0.0
+        block_size = max(1, sequence_length // 4)
         for _ in range(n_repeats):
-            corrupted = val_seq.copy()  # (N, seq_len, n_features)
-            # Block-permute feature fi across the time axis within each sample
-            for si in range(corrupted.shape[0]):
-                corrupted[si, :, fi] = _block_permute(corrupted[si, :, fi], block_size=max(1, sequence_length // 4), rng=rng)
-            corrupted_tensor = torch.tensor(corrupted, dtype=torch.float32).to(device)
-            with torch.no_grad():
-                recon_corrupted = model(corrupted_tensor)
-                mse_corrupted = torch.mean((recon_corrupted - val_device) ** 2).item()
+            def corrupt_fn(batch_np, _fi=fi, _bs=block_size, _rng=rng):
+                for si in range(batch_np.shape[0]):
+                    batch_np[si, :, _fi] = _block_permute(
+                        batch_np[si, :, _fi], block_size=_bs, rng=_rng
+                    )
+                return batch_np
+
+            mse_corrupted = _batched_mse(model, val_loader, device, corrupt_fn=corrupt_fn)
             delta_sum += mse_corrupted - baseline_mse
         importance_scores[fi] = delta_sum / n_repeats
 
+    # --- Logging (unchanged) ---
     print("\n  Feature masking importance (ΔMSE):")
     ranked = np.argsort(importance_scores)[::-1]
     for rank, fi in enumerate(ranked):
