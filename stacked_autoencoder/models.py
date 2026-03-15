@@ -5,6 +5,24 @@ import torch
 import torch.nn as nn
 
 
+class ResidualMLPFusion(nn.Module):
+    """Small residual MLP to fuse concatenated group representations."""
+
+    def __init__(self, dim, dropout=0.1):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.fc1 = nn.Linear(dim, 2 * dim)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(2 * dim, dim)
+
+    def forward(self, x):
+        residual = x
+        out = self.norm(x)
+        out = self.fc2(self.drop(self.act(self.fc1(out))))
+        return residual + out
+
+
 class LSTMEncoder(nn.Module):
     def __init__(self, input_dim, hidden_dim, latent_dim, num_layers=1):
         super(LSTMEncoder, self).__init__()
@@ -34,7 +52,8 @@ class SharedDecoder(nn.Module):
 
 class LSTMVAE_Grouped(nn.Module):
     def __init__(self, encoder_groups, hidden_dim, latent_dim, sequence_length,
-                 num_layers=1, device='cpu', group_weights=None, binary_group_flags=None):
+                 num_layers=1, device='cpu', group_weights=None, binary_group_flags=None,
+                 use_fusion=False, fusion_dropout=0.1):
         """
         Args:
             encoder_groups: list[list[int]] — feature indices per encoder group
@@ -48,6 +67,8 @@ class LSTMVAE_Grouped(nn.Module):
             binary_group_flags: optional list[bool] — one per group, True if all
                                features in that group are binary. Used to select
                                BCE loss instead of MSE for those groups.
+            use_fusion: if True, apply ResidualMLPFusion on concatenated mean/logvar
+            fusion_dropout: dropout rate for fusion MLP
         """
         super(LSTMVAE_Grouped, self).__init__()
         self.encoder_groups = encoder_groups
@@ -55,6 +76,7 @@ class LSTMVAE_Grouped(nn.Module):
         self.device = device
         self.n_total_features = sum(len(g) for g in encoder_groups)
         self.binary_group_flags = binary_group_flags
+        self.use_fusion = use_fusion
         n_groups = len(encoder_groups)
 
         self.encoders = nn.ModuleList([
@@ -82,6 +104,10 @@ class LSTMVAE_Grouped(nn.Module):
             decoder_input_dim, hidden_dim, self.n_total_features, sequence_length, num_layers
         )
 
+        if self.use_fusion:
+            self.mean_fuser = ResidualMLPFusion(decoder_input_dim, dropout=fusion_dropout)
+            self.logvar_fuser = ResidualMLPFusion(decoder_input_dim, dropout=fusion_dropout)
+
     def reparameterize(self, mean, logvar):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
@@ -106,6 +132,11 @@ class LSTMVAE_Grouped(nn.Module):
 
         mean = torch.cat(means, dim=1)
         logvar = torch.cat(logvars, dim=1)
+
+        if self.use_fusion:
+            mean = self.mean_fuser(mean)
+            logvar = self.logvar_fuser(logvar)
+
         z = self.reparameterize(mean, logvar)
         x_recon = self.decoder(z)
 

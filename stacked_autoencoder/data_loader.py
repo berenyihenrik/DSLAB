@@ -5,6 +5,7 @@ import os
 import ast
 import numpy as np
 import pandas as pd
+from torch.utils.data import Dataset
 
 
 # =============================================================================
@@ -161,6 +162,135 @@ def get_available_machines(drive_path):
         machines.sort()
         return machines
     return []
+
+
+# =============================================================================
+# SWaT (Secure Water Treatment) Dataset Functions
+# =============================================================================
+
+def load_swat_data(normal_path, attack_path):
+    """Load SWaT normal and attack CSV files.
+
+    SWaT quirks handled here:
+        1. Strip leading/trailing whitespace from all column names.
+        2. Normalize the known label typo "A ttack" -> "Attack".
+        3. Drop Timestamp column and return only numeric feature columns.
+
+    Args:
+        normal_path: Path to SWaT normal CSV.
+        attack_path: Path to SWaT attack CSV.
+
+    Returns:
+        train_data: numpy array of normal features (rows, 51)
+        test_data: numpy array of attack features (rows, 51)
+        true_anomalies: binary numpy array for attack labels (0/1)
+    """
+    print(f"Loading SWaT normal data from: {normal_path}")
+    print(f"Loading SWaT attack data from: {attack_path}")
+
+    normal_df = pd.read_csv(normal_path, low_memory=False)
+    attack_df = pd.read_csv(attack_path, low_memory=False)
+
+    # Header cleanup is required because attack CSV has leading spaces in
+    # multiple columns (e.g. " MV101", " Timestamp").
+    normal_df.columns = normal_df.columns.str.strip()
+    attack_df.columns = attack_df.columns.str.strip()
+
+    label_col = "Normal/Attack"
+    timestamp_col = "Timestamp"
+    if label_col not in normal_df.columns or label_col not in attack_df.columns:
+        raise ValueError("SWaT label column 'Normal/Attack' not found after header cleanup")
+
+    # Normalize typo and spacing variations in labels.
+    attack_labels = (
+        attack_df[label_col]
+        .astype(str)
+        .str.strip()
+        .replace({"A ttack": "Attack"})
+    )
+    true_anomalies = (attack_labels == "Attack").astype(int).to_numpy()
+
+    # Keep only feature columns (drop timestamp + label).
+    feature_cols = [c for c in normal_df.columns if c not in {timestamp_col, label_col}]
+    if len(feature_cols) == 0:
+        raise ValueError("No SWaT feature columns found after removing Timestamp/Normal/Attack")
+
+    normal_features = normal_df[feature_cols].apply(pd.to_numeric, errors='coerce')
+    attack_features = attack_df[feature_cols].apply(pd.to_numeric, errors='coerce')
+
+    train_data = normal_features.to_numpy(dtype=np.float32)
+    test_data = attack_features.to_numpy(dtype=np.float32)
+
+    if np.isnan(train_data).any() or np.isnan(test_data).any():
+        raise ValueError("NaN values encountered while loading SWaT numeric feature columns")
+
+    print(f"SWaT train data shape: {train_data.shape}")
+    print(f"SWaT test data shape: {test_data.shape}")
+    print(f"SWaT feature count: {len(feature_cols)}")
+    print(f"SWaT anomalous points: {np.sum(true_anomalies)} / {len(true_anomalies)}")
+    print(f"SWaT anomaly rate: {np.mean(true_anomalies) * 100:.2f}%")
+
+    return train_data, test_data, true_anomalies
+
+
+class GroupedSequenceDataset(Dataset):
+    """Lazy grouped sequence dataset to avoid materializing all windows.
+
+    Each item is a tuple with one array per encoder group. For index ``i``
+    we return windows ``[i:i+sequence_length]`` from each group.
+    """
+
+    def __init__(self, data_groups, sequence_length):
+        if not data_groups:
+            raise ValueError("data_groups must contain at least one group")
+        if sequence_length <= 0:
+            raise ValueError("sequence_length must be > 0")
+
+        n_rows = data_groups[0].shape[0]
+        for group in data_groups:
+            if group.shape[0] != n_rows:
+                raise ValueError("All groups in data_groups must have matching time dimension")
+
+        self.data_groups = data_groups
+        self.sequence_length = sequence_length
+        self.n_samples = n_rows - sequence_length + 1
+        if self.n_samples <= 0:
+            raise ValueError("sequence_length is larger than number of timesteps")
+
+    def __len__(self):
+        return self.n_samples
+
+    def __getitem__(self, idx):
+        if idx < 0 or idx >= self.n_samples:
+            raise IndexError("GroupedSequenceDataset index out of range")
+        return tuple(group[idx:idx + self.sequence_length] for group in self.data_groups)
+
+
+def standardize_continuous_features(train_data, other_arrays, continuous_indices):
+    """Z-score continuous features using train-only statistics.
+
+    Args:
+        train_data: training array (timesteps, features), transformed in place.
+        other_arrays: list of arrays to transform using train stats.
+        continuous_indices: iterable of column indices to standardize.
+
+    Returns:
+        train_data: standardized training array (same object, modified in place)
+        transformed_others: list of transformed arrays (same objects, modified)
+    """
+    continuous_indices = list(continuous_indices)
+    if len(continuous_indices) == 0:
+        return train_data, other_arrays
+
+    means = train_data[:, continuous_indices].mean(axis=0)
+    stds = train_data[:, continuous_indices].std(axis=0)
+    stds[stds == 0] = 1.0
+
+    train_data[:, continuous_indices] = (train_data[:, continuous_indices] - means) / stds
+    for arr in other_arrays:
+        arr[:, continuous_indices] = (arr[:, continuous_indices] - means) / stds
+
+    return train_data, other_arrays
 
 
 # =============================================================================
