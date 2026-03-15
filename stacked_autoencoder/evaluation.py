@@ -253,6 +253,30 @@ def calculate_f1_score_smap_msl(anomaly_indices, true_anomalies, sequence_length
 calculate_f1_score = calculate_f1_score_smap_msl
 
 
+def extract_anomaly_sequences_from_labels(true_anomalies):
+    """Extract contiguous anomaly segments from binary labels."""
+    labels = np.asarray(true_anomalies).astype(int)
+    if labels.ndim != 1:
+        raise ValueError("true_anomalies must be a 1-D array")
+
+    sequences = []
+    in_segment = False
+    start = 0
+
+    for i, value in enumerate(labels):
+        if value == 1 and not in_segment:
+            in_segment = True
+            start = i
+        elif value == 0 and in_segment:
+            sequences.append([start, i - 1])
+            in_segment = False
+
+    if in_segment:
+        sequences.append([start, len(labels) - 1])
+
+    return sequences
+
+
 def point_adjust_f1_score(anomaly_indices, true_anomalies, sequence_length, anomaly_sequences):
     """
     Calculate Point-Adjust F1 score used in SMAP/MSL literature.
@@ -313,7 +337,7 @@ def point_adjust_f1_score(anomaly_indices, true_anomalies, sequence_length, anom
 
 
 def print_evaluation_results(anomaly_scores, anomalies, true_anomalies, sequence_length, 
-                             percentile_threshold, anomaly_sequences):
+                             percentile_threshold, anomaly_sequences, threshold_value=None):
     """
     Print comprehensive evaluation results.
     
@@ -325,7 +349,8 @@ def print_evaluation_results(anomaly_scores, anomalies, true_anomalies, sequence
         percentile_threshold: Percentile threshold used
         anomaly_sequences: List of anomaly segments
     """
-    threshold_value = np.percentile(anomaly_scores, percentile_threshold)
+    if threshold_value is None:
+        threshold_value = np.percentile(anomaly_scores, percentile_threshold)
     
     print("\n--- Anomaly Score Diagnostics ---")
     print(f"Anomaly scores - Min: {np.min(anomaly_scores):.4f}, Max: {np.max(anomaly_scores):.4f}")
@@ -370,7 +395,7 @@ def print_evaluation_results(anomaly_scores, anomalies, true_anomalies, sequence
 
 
 def print_evaluation_results_simple(anomaly_scores, anomalies, true_anomalies, sequence_length, 
-                                    percentile_threshold):
+                                    percentile_threshold, threshold_value=None):
     """
     Print evaluation results without point-adjust metrics (for SMD dataset).
     
@@ -386,7 +411,8 @@ def print_evaluation_results_simple(anomaly_scores, anomalies, true_anomalies, s
         predicted_anomalies: Binary prediction array
         adjusted_true_anomalies: Adjusted ground truth labels
     """
-    threshold_value = np.percentile(anomaly_scores, percentile_threshold)
+    if threshold_value is None:
+        threshold_value = np.percentile(anomaly_scores, percentile_threshold)
     
     print("\n--- Anomaly Score Diagnostics ---")
     print(f"Anomaly scores - Min: {np.min(anomaly_scores):.4f}, Max: {np.max(anomaly_scores):.4f}")
