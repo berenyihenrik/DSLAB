@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""A/B test: baseline vs ResidualMLPFusion on synthetic grouped anomalies."""
+"""A/B test: fusion variants on synthetic grouped anomalies."""
 
 import os
 import random
@@ -33,6 +33,7 @@ from training import loss_function_grouped, train_model_grouped
 
 
 SEEDS = [0, 1, 2, 3, 4]
+FUSION_TYPES = ["none", "mlp", "attn_mean"]
 ENCODER_GROUPS = [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]]
 HARD_TYPES = [
     "spatial_regime_desync_g1",
@@ -95,7 +96,7 @@ def _type_metrics(scores, threshold, adjusted_true, adjusted_type):
     return f1, aucpr, sep
 
 
-def run_single(seed, use_fusion):
+def run_single(seed, fusion_type):
     set_seed(seed)
     device = DEVICE
     cfg = SyntheticConfig()
@@ -119,7 +120,7 @@ def run_single(seed, use_fusion):
     val_loader = DataLoader(val_data, batch_size=BATCH_SIZE, shuffle=False, **loader_kwargs)
     test_loader = DataLoader(seqs_test, batch_size=BATCH_SIZE, shuffle=False, **loader_kwargs)
 
-    tag = "fusion" if use_fusion else "baseline"
+    tag = fusion_type
     print(f"\n{'='*72}")
     print(f"seed={seed} variant={tag} groups={len(ENCODER_GROUPS)}")
     print(f"{'='*72}")
@@ -131,7 +132,7 @@ def run_single(seed, use_fusion):
         sequence_length=cfg.seq_len,
         num_layers=NUM_LAYERS,
         device=device,
-        use_fusion=use_fusion,
+        fusion_type=fusion_type,
     ).to(device)
 
     optimizer = Adam(model.parameters(), lr=LEARNING_RATE)
@@ -199,8 +200,8 @@ def _mean_std(values):
 def main():
     results = []
     for seed in SEEDS:
-        for use_fusion in [False, True]:
-            results.append(run_single(seed, use_fusion))
+        for fusion_type in FUSION_TYPES:
+            results.append(run_single(seed, fusion_type))
 
     print("\n" + "=" * 86)
     print(f"{'Seed':>4}  {'Variant':>8}  {'F1':>7}  {'AUCPR':>7}  {'ScoreSep':>9}")
@@ -208,7 +209,7 @@ def main():
     for r in results:
         print(f"{r['seed']:>4}  {r['variant']:>8}  {r['f1']:7.4f}  {r['aucpr']:7.4f}  {r['score_sep']:9.4f}")
 
-    for variant in ["baseline", "fusion"]:
+    for variant in FUSION_TYPES:
         subset = [r for r in results if r["variant"] == variant]
         f1_mean, f1_std = _mean_std([r["f1"] for r in subset])
         auc_mean, auc_std = _mean_std([r["aucpr"] for r in subset])
@@ -217,7 +218,7 @@ def main():
     print("\nPer-type AUCPR mean ± std")
     print("-" * 86)
     for anomaly_type in ANOMALY_TYPES:
-        for variant in ["baseline", "fusion"]:
+        for variant in FUSION_TYPES:
             vals = [
                 r["per_type"][anomaly_type]["aucpr"]
                 for r in results
@@ -229,31 +230,36 @@ def main():
     print("\nWin counts by anomaly type (AUCPR)")
     print("-" * 86)
     for anomaly_type in ANOMALY_TYPES:
-        wins = 0
-        for seed in SEEDS:
-            b = next(r for r in results if r["seed"] == seed and r["variant"] == "baseline")
-            f = next(r for r in results if r["seed"] == seed and r["variant"] == "fusion")
-            wins += int(f["per_type"][anomaly_type]["aucpr"] > b["per_type"][anomaly_type]["aucpr"])
-        print(f"{anomaly_type:30s} fusion wins {wins}/{len(SEEDS)}")
-
-    hard_wins = 0
-    control_deltas = []
-    for seed in SEEDS:
-        b = next(r for r in results if r["seed"] == seed and r["variant"] == "baseline")
-        f = next(r for r in results if r["seed"] == seed and r["variant"] == "fusion")
-
-        b_hard = np.nanmean([b["per_type"][t]["aucpr"] for t in HARD_TYPES])
-        f_hard = np.nanmean([f["per_type"][t]["aucpr"] for t in HARD_TYPES])
-        hard_wins += int(f_hard > b_hard)
-
-        b_ctl = np.nanmean([b["per_type"][t]["aucpr"] for t in CONTROL_TYPES])
-        f_ctl = np.nanmean([f["per_type"][t]["aucpr"] for t in CONTROL_TYPES])
-        control_deltas.append(float(f_ctl - b_ctl))
+        for candidate in [v for v in FUSION_TYPES if v != "none"]:
+            wins = 0
+            for seed in SEEDS:
+                b = next(r for r in results if r["seed"] == seed and r["variant"] == "none")
+                c = next(r for r in results if r["seed"] == seed and r["variant"] == candidate)
+                wins += int(c["per_type"][anomaly_type]["aucpr"] > b["per_type"][anomaly_type]["aucpr"])
+            print(f"{anomaly_type:30s} {candidate:>8s} wins {wins}/{len(SEEDS)} vs none")
 
     print("\nAcceptance diagnostics")
     print("-" * 86)
-    print(f"Fusion wins on hard anomalies (seed-wise mean AUCPR): {hard_wins}/{len(SEEDS)}")
-    print(f"Control AUCPR delta (fusion-baseline): mean={np.mean(control_deltas):.4f} std={np.std(control_deltas):.4f}")
+    for candidate in [v for v in FUSION_TYPES if v != "none"]:
+        hard_wins = 0
+        control_deltas = []
+        for seed in SEEDS:
+            b = next(r for r in results if r["seed"] == seed and r["variant"] == "none")
+            c = next(r for r in results if r["seed"] == seed and r["variant"] == candidate)
+
+            b_hard = np.nanmean([b["per_type"][t]["aucpr"] for t in HARD_TYPES])
+            c_hard = np.nanmean([c["per_type"][t]["aucpr"] for t in HARD_TYPES])
+            hard_wins += int(c_hard > b_hard)
+
+            b_ctl = np.nanmean([b["per_type"][t]["aucpr"] for t in CONTROL_TYPES])
+            c_ctl = np.nanmean([c["per_type"][t]["aucpr"] for t in CONTROL_TYPES])
+            control_deltas.append(float(c_ctl - b_ctl))
+
+        print(f"{candidate:>8s} wins on hard anomalies: {hard_wins}/{len(SEEDS)}")
+        print(
+            f"{candidate:>8s} control AUCPR delta (candidate-none): "
+            f"mean={np.mean(control_deltas):.4f} std={np.std(control_deltas):.4f}"
+        )
 
 
 if __name__ == "__main__":
