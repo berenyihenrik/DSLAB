@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""A/B test: baseline vs ResidualMLPFusion on SMD machine-1-1."""
+"""A/B test: fusion variants on SMD machine-1-1."""
 
 import os
 import random
@@ -23,6 +23,7 @@ from evaluation import fit_group_ecdf, compute_anomaly_scores_grouped, compute_t
 
 
 SEEDS = [0, 1, 2]
+FUSION_TYPES = ["none", "mlp", "attn_mean"]
 
 
 def set_seed(seed):
@@ -32,7 +33,7 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-def run_single(seed, use_fusion):
+def run_single(seed, fusion_type):
     """Train and evaluate one model. Returns dict of metrics."""
     set_seed(seed)
     device = DEVICE
@@ -71,7 +72,7 @@ def run_single(seed, use_fusion):
     test_loader = DataLoader(seqs_test, batch_size=bs, shuffle=False, **lk)
 
     # --- model ---
-    tag = "fusion" if use_fusion else "baseline"
+    tag = fusion_type
     print(f"\n{'='*60}")
     print(f"  seed={seed}  variant={tag}  groups={len(encoder_groups)}")
     print(f"{'='*60}")
@@ -83,7 +84,7 @@ def run_single(seed, use_fusion):
         sequence_length=seq_len,
         num_layers=params["num_layers"],
         device=device,
-        use_fusion=use_fusion,
+        fusion_type=fusion_type,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -128,8 +129,8 @@ def run_single(seed, use_fusion):
 def main():
     results = []
     for seed in SEEDS:
-        for use_fusion in [False, True]:
-            res = run_single(seed, use_fusion)
+        for fusion_type in FUSION_TYPES:
+            res = run_single(seed, fusion_type)
             results.append(res)
 
     # --- summary table ---
@@ -141,7 +142,7 @@ def main():
               f"{r['score_sep']:9.4f}  {r['n_params']:>9,}")
 
     # Aggregate
-    for variant in ["baseline", "fusion"]:
+    for variant in FUSION_TYPES:
         subset = [r for r in results if r["variant"] == variant]
         f1s = [r["f1"] for r in subset]
         aucprs = [r["aucpr"] for r in subset]
@@ -149,14 +150,11 @@ def main():
               f"AUCPR mean={np.mean(aucprs):.4f} ± {np.std(aucprs):.4f}")
 
     # Decision
-    base_f1s = [r["f1"] for r in results if r["variant"] == "baseline"]
-    fuse_f1s = [r["f1"] for r in results if r["variant"] == "fusion"]
-    wins = sum(f > b for f, b in zip(fuse_f1s, base_f1s))
-    print(f"\n  Fusion wins {wins}/{len(SEEDS)} seeds on F1.")
-    if wins == len(SEEDS):
-        print("  ✓ Fusion consistently improves F1 — accept.")
-    else:
-        print("  ✗ Fusion does NOT consistently improve — reject or investigate.")
+    base_f1s = [r["f1"] for r in results if r["variant"] == "none"]
+    for candidate in [v for v in FUSION_TYPES if v != "none"]:
+        cand_f1s = [r["f1"] for r in results if r["variant"] == candidate]
+        wins = sum(c > b for c, b in zip(cand_f1s, base_f1s))
+        print(f"\n  {candidate} wins {wins}/{len(SEEDS)} seeds on F1 vs none.")
 
 
 if __name__ == "__main__":

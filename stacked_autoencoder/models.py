@@ -23,6 +23,52 @@ class ResidualMLPFusion(nn.Module):
         return residual + out
 
 
+class GroupSelfAttentionFusion(nn.Module):
+    """Self-attention fusion over per-group latent tokens."""
+
+    def __init__(self, n_groups, latent_dim, dropout=0.1, num_heads=1):
+        super().__init__()
+        if latent_dim % num_heads != 0:
+            raise ValueError("latent_dim must be divisible by num_heads")
+
+        self.n_groups = n_groups
+        self.latent_dim = latent_dim
+        self.group_embed = nn.Parameter(torch.randn(1, n_groups, latent_dim) * 0.02)
+
+        self.norm1 = nn.LayerNorm(latent_dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=latent_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.attn_drop = nn.Dropout(dropout)
+
+        self.norm2 = nn.LayerNorm(latent_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(latent_dim, 2 * latent_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(2 * latent_dim, latent_dim),
+        )
+        self.ffn_drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        batch_size = x.size(0)
+        tokens = x.reshape(batch_size, self.n_groups, self.latent_dim)
+        tokens = tokens + self.group_embed
+
+        attn_in = self.norm1(tokens)
+        attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+        tokens = tokens + self.attn_drop(attn_out)
+
+        ffn_in = self.norm2(tokens)
+        ffn_out = self.ffn(ffn_in)
+        tokens = tokens + self.ffn_drop(ffn_out)
+
+        return tokens.reshape(batch_size, self.n_groups * self.latent_dim)
+
+
 class LSTMEncoder(nn.Module):
     def __init__(self, input_dim, hidden_dim, latent_dim, num_layers=1):
         super(LSTMEncoder, self).__init__()
@@ -53,7 +99,7 @@ class SharedDecoder(nn.Module):
 class LSTMVAE_Grouped(nn.Module):
     def __init__(self, encoder_groups, hidden_dim, latent_dim, sequence_length,
                  num_layers=1, device='cpu', group_weights=None, binary_group_flags=None,
-                 use_fusion=False, fusion_dropout=0.1):
+                 fusion_type="none", fusion_dropout=0.1):
         """
         Args:
             encoder_groups: list[list[int]] — feature indices per encoder group
@@ -67,7 +113,8 @@ class LSTMVAE_Grouped(nn.Module):
             binary_group_flags: optional list[bool] — one per group, True if all
                                features in that group are binary. Used to select
                                BCE loss instead of MSE for those groups.
-            use_fusion: if True, apply ResidualMLPFusion on concatenated mean/logvar
+            fusion_type: fusion strategy for concatenated latents. One of
+                         "none", "mlp", "attn_mean", "attn_both".
             fusion_dropout: dropout rate for fusion MLP
         """
         super(LSTMVAE_Grouped, self).__init__()
@@ -76,7 +123,12 @@ class LSTMVAE_Grouped(nn.Module):
         self.device = device
         self.n_total_features = sum(len(g) for g in encoder_groups)
         self.binary_group_flags = binary_group_flags
-        self.use_fusion = use_fusion
+        valid_fusion_types = {"none", "mlp", "attn_mean", "attn_both"}
+        if fusion_type not in valid_fusion_types:
+            raise ValueError(
+                f"fusion_type must be one of {sorted(valid_fusion_types)}, got {fusion_type!r}"
+            )
+        self.fusion_type = fusion_type
         n_groups = len(encoder_groups)
 
         self.encoders = nn.ModuleList([
@@ -104,9 +156,26 @@ class LSTMVAE_Grouped(nn.Module):
             decoder_input_dim, hidden_dim, self.n_total_features, sequence_length, num_layers
         )
 
-        if self.use_fusion:
+        if self.fusion_type == "mlp":
             self.mean_fuser = ResidualMLPFusion(decoder_input_dim, dropout=fusion_dropout)
             self.logvar_fuser = ResidualMLPFusion(decoder_input_dim, dropout=fusion_dropout)
+        elif self.fusion_type == "attn_mean":
+            self.mean_fuser = GroupSelfAttentionFusion(
+                n_groups=n_groups,
+                latent_dim=latent_dim,
+                dropout=fusion_dropout,
+            )
+        elif self.fusion_type == "attn_both":
+            self.mean_fuser = GroupSelfAttentionFusion(
+                n_groups=n_groups,
+                latent_dim=latent_dim,
+                dropout=fusion_dropout,
+            )
+            self.logvar_fuser = GroupSelfAttentionFusion(
+                n_groups=n_groups,
+                latent_dim=latent_dim,
+                dropout=fusion_dropout,
+            )
 
     def reparameterize(self, mean, logvar):
         std = torch.exp(0.5 * logvar)
@@ -133,7 +202,12 @@ class LSTMVAE_Grouped(nn.Module):
         mean = torch.cat(means, dim=1)
         logvar = torch.cat(logvars, dim=1)
 
-        if self.use_fusion:
+        if self.fusion_type == "mlp":
+            mean = self.mean_fuser(mean)
+            logvar = self.logvar_fuser(logvar)
+        elif self.fusion_type == "attn_mean":
+            mean = self.mean_fuser(mean)
+        elif self.fusion_type == "attn_both":
             mean = self.mean_fuser(mean)
             logvar = self.logvar_fuser(logvar)
 
