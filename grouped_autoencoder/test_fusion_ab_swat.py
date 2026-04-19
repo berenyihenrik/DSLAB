@@ -1,0 +1,498 @@
+# -*- coding: utf-8 -*-
+"""A/B test: fusion variants on SWaT with multi-seed reporting.
+
+Protocol mirrors `test_fusion_ab.py` and `main_swat.py`:
+- seeds 0..4
+- contiguous train/validation split on normal SWaT series
+- train-only binary normalization + continuous standardization
+- deterministic shared feature grouping across seeds/variants
+- ECDF-calibrated scoring and validation-calibrated thresholding
+
+Runtime control:
+- SWAT_TRAIN_SUBSAMPLE_RATIO (default 0.40): strided window subsampling for train
+- SWAT_VAL_SUBSAMPLE_RATIO (default 0.50): strided window subsampling for val
+- SWAT_TEST_SUBSAMPLE_RATIO (default 0.50): strided window subsampling for test
+- SWAT_FS_SUBSAMPLE_RATIO (default 0.15): raw-timestep subsampling for feature selection
+- NUM_EPOCHS_OVERRIDE (optional): override config.NUM_EPOCHS
+"""
+
+import os
+import random
+from functools import partial
+import contextlib
+import io
+import json
+from datetime import datetime
+
+import numpy as np
+import torch
+from sklearn.metrics import average_precision_score, f1_score, precision_recall_curve
+from torch.optim import Adam
+from torch.utils.data import DataLoader, Subset
+
+from config import (
+    SWAT_NORMAL_DATASET, SWAT_ATTACK_DATASET, SWAT_VAL_RATIO,
+    SEQUENCE_LENGTH, DEFAULT_PARAMS_SWAT, DEVICE, NUM_EPOCHS,
+    USE_AMP, DATALOADER_WORKERS, PIN_MEMORY,
+)
+from data_loader import (
+    GroupedSequenceDataset, detect_binary_features,
+    load_swat_data, standardize_continuous_features,
+)
+from evaluation import (
+    compute_anomaly_scores_grouped, compute_threshold_from_baseline, fit_group_ecdf,
+)
+from feature_selection import perform_feature_selection, split_features_by_groups
+from models import LSTMVAE_Grouped
+from training import loss_function_grouped, train_model_grouped
+
+
+DEFAULT_SEEDS = [0, 1, 2, 3, 4]
+DEFAULT_FUSION_TYPES = ["none", "mlp", "mlp_mean", "attn_mean"]
+OUTPUT_ROOT = os.path.join(os.path.dirname(__file__), "ecdf_results")
+
+TRAIN_SUBSAMPLE_RATIO = float(os.getenv("SWAT_TRAIN_SUBSAMPLE_RATIO", "0.40"))
+VAL_SUBSAMPLE_RATIO = float(os.getenv("SWAT_VAL_SUBSAMPLE_RATIO", "0.50"))
+FS_SUBSAMPLE_RATIO = float(os.getenv("SWAT_FS_SUBSAMPLE_RATIO", "0.15"))
+TEST_SUBSAMPLE_RATIO = float(os.getenv("SWAT_TEST_SUBSAMPLE_RATIO", "0.50"))
+EPOCHS_OVERRIDE_RAW = os.getenv("NUM_EPOCHS_OVERRIDE")
+VERBOSE_TRAINING = os.getenv("SWAT_VERBOSE_TRAINING", "0") == "1"
+EXPORT_CURVE_ARTIFACTS = os.getenv("EXPORT_CURVE_ARTIFACTS", "1") == "1"
+
+
+def _parse_int_list_env(name, default):
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    values = [int(token.strip()) for token in raw.split(",") if token.strip()]
+    return values or default
+
+
+def _parse_str_list_env(name, default):
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    values = [token.strip() for token in raw.split(",") if token.strip()]
+    return values or default
+
+
+SEEDS = _parse_int_list_env("SEEDS_OVERRIDE", DEFAULT_SEEDS)
+FUSION_TYPES = _parse_str_list_env("FUSION_TYPES_OVERRIDE", DEFAULT_FUSION_TYPES)
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def _normalize_binary_with_train_stats(train_data, other_arrays, binary_indices):
+    """Normalize two-valued features to [0,1] using train-only min/max."""
+    for idx in sorted(binary_indices):
+        col_min = train_data[:, idx].min()
+        col_max = train_data[:, idx].max()
+        if col_max > col_min:
+            train_data[:, idx] = (train_data[:, idx] - col_min) / (col_max - col_min)
+            for arr in other_arrays:
+                arr[:, idx] = (arr[:, idx] - col_min) / (col_max - col_min)
+    return train_data, other_arrays
+
+
+def _validate_ratio(name, ratio):
+    if not (0.0 < ratio <= 1.0):
+        raise ValueError(f"{name} must be in (0, 1], got {ratio}")
+
+
+def _strided_subsample(dataset, ratio, tag, return_indices=False):
+    """Reduce overlap-heavy windows by taking an approximately uniform stride."""
+    _validate_ratio(f"{tag} subsample ratio", ratio)
+    n_total = len(dataset)
+    if ratio >= 1.0:
+        indices = np.arange(n_total, dtype=np.int64)
+        if return_indices:
+            return dataset, n_total, n_total, indices
+        return dataset, n_total, n_total
+
+    n_target = max(1, int(round(n_total * ratio)))
+    stride = max(1, n_total // n_target)
+    indices = np.arange(0, n_total, stride, dtype=np.int64)[:n_target]
+    subset = Subset(dataset, indices.tolist())
+    if return_indices:
+        return subset, len(indices), n_total, indices
+    return subset, len(indices), n_total
+
+
+def _subsample_timesteps_for_fs(data, ratio, seq_len):
+    """Subsample raw timesteps before feature selection to speed up Stage-2 AE."""
+    _validate_ratio("feature-selection subsample ratio", ratio)
+    n_total = data.shape[0]
+    if ratio >= 1.0:
+        return data, n_total, n_total
+
+    min_rows = seq_len + 1
+    n_target = max(min_rows, int(round(n_total * ratio)))
+    stride = max(1, n_total // n_target)
+    sampled = data[::stride]
+    if sampled.shape[0] > n_target:
+        sampled = sampled[:n_target]
+    if sampled.shape[0] < min_rows:
+        sampled = data[:min_rows]
+    return sampled, sampled.shape[0], n_total
+
+
+def _resolve_num_epochs():
+    if EPOCHS_OVERRIDE_RAW is None:
+        return NUM_EPOCHS
+    override = int(EPOCHS_OVERRIDE_RAW)
+    if override <= 0:
+        raise ValueError(f"NUM_EPOCHS_OVERRIDE must be > 0, got {override}")
+    return override
+
+
+def _save_curve_artifact(output_dir, dataset, seed, variant, labels, scores, preds, threshold, test_indices):
+    """Persist per-run score data and PR coordinates for plotting."""
+    precision, recall, pr_thresholds = precision_recall_curve(labels, scores)
+    artifact_path = None
+    if EXPORT_CURVE_ARTIFACTS:
+        artifact_path = os.path.join(output_dir, f"{dataset}_{variant}_seed{seed}_curve.npz")
+        np.savez_compressed(
+            artifact_path,
+            labels=np.asarray(labels, dtype=np.int8),
+            scores=np.asarray(scores, dtype=np.float32),
+            predictions=np.asarray(preds, dtype=np.int8),
+            precision=np.asarray(precision, dtype=np.float32),
+            recall=np.asarray(recall, dtype=np.float32),
+            pr_thresholds=np.asarray(pr_thresholds, dtype=np.float32),
+            threshold=np.asarray([threshold], dtype=np.float32),
+            test_indices=np.asarray(test_indices, dtype=np.int32),
+        )
+    if artifact_path is not None:
+        artifact_path = os.path.basename(artifact_path)
+    return precision, recall, artifact_path
+
+
+def _prepare_swat(device, params, seq_len):
+    """Prepare SWaT data, shared feature groups, and grouped sequence datasets."""
+    metric_train, metric_test, true_anomalies = load_swat_data(
+        SWAT_NORMAL_DATASET, SWAT_ATTACK_DATASET
+    )
+
+    split_idx = int(len(metric_train) * (1.0 - SWAT_VAL_RATIO))
+    train_series = metric_train[:split_idx].astype(np.float32, copy=True)
+    val_series = metric_train[split_idx:].astype(np.float32, copy=True)
+    test_series = metric_test.astype(np.float32, copy=True)
+    print(
+        f"SWaT contiguous split: train={len(train_series)}, val={len(val_series)}, "
+        f"test={len(test_series)}"
+    )
+
+    binary_feature_indices = detect_binary_features(train_series)
+    all_indices = set(range(train_series.shape[1]))
+    continuous_indices = sorted(all_indices - binary_feature_indices)
+    print(
+        f"SWaT feature split: {len(binary_feature_indices)} binary, "
+        f"{len(continuous_indices)} continuous"
+    )
+
+    if binary_feature_indices:
+        train_series, [val_series, test_series] = _normalize_binary_with_train_stats(
+            train_series, [val_series, test_series], binary_feature_indices
+        )
+
+    train_series, [val_series, test_series] = standardize_continuous_features(
+        train_series, [val_series, test_series], continuous_indices
+    )
+
+    encoder_groups = []
+    dropped_feature_indices = []
+    if continuous_indices:
+        continuous_train = train_series[:, continuous_indices]
+        fs_train, fs_used, fs_total = _subsample_timesteps_for_fs(
+            continuous_train, FS_SUBSAMPLE_RATIO, seq_len
+        )
+        print(f"Feature-selection rows: {fs_used}/{fs_total}")
+        cont_groups_local, dropped_local = perform_feature_selection(
+            fs_train,
+            fs_train.shape[1],
+            seq_len,
+            device,
+            corr_threshold=params.get("corr_threshold", 0.9),
+            importance_percentile=params.get("importance_percentile", 50),
+        )
+        encoder_groups.extend(
+            sorted(continuous_indices[idx] for idx in group) for group in cont_groups_local
+        )
+        dropped_feature_indices = [continuous_indices[idx] for idx in dropped_local]
+
+    binary_group = sorted(binary_feature_indices)
+    if binary_group:
+        encoder_groups.append(binary_group)
+
+    if not encoder_groups:
+        raise RuntimeError("No encoder groups were produced for SWaT")
+
+    binary_feature_set = set(binary_feature_indices)
+    binary_group_flags = [all(idx in binary_feature_set for idx in group) for group in encoder_groups]
+
+    print(f"Encoder groups: {len(encoder_groups)}")
+    for i, group in enumerate(encoder_groups):
+        kind = "binary" if binary_group_flags[i] else "continuous"
+        print(f"  Group {i}: {len(group)} features ({kind})")
+    if dropped_feature_indices:
+        print(f"Dropped {len(dropped_feature_indices)} static continuous features.")
+
+    data_groups_train = split_features_by_groups(train_series, encoder_groups)
+    data_groups_val = split_features_by_groups(val_series, encoder_groups)
+    data_groups_test = split_features_by_groups(test_series, encoder_groups)
+
+    train_dataset = GroupedSequenceDataset(data_groups_train, seq_len)
+    val_dataset = GroupedSequenceDataset(data_groups_val, seq_len)
+    test_dataset = GroupedSequenceDataset(data_groups_test, seq_len)
+
+    return train_dataset, val_dataset, test_dataset, true_anomalies, encoder_groups, binary_group_flags
+
+
+def run_single(seed, fusion_type, train_dataset, val_dataset, test_dataset,
+               true_anomalies, encoder_groups, binary_group_flags, params,
+               seq_len, device, num_epochs, output_dir):
+    set_seed(seed)
+
+    train_data, train_used, train_total = _strided_subsample(
+        train_dataset, TRAIN_SUBSAMPLE_RATIO, "train"
+    )
+    val_data, val_used, val_total = _strided_subsample(
+        val_dataset, VAL_SUBSAMPLE_RATIO, "val"
+    )
+    test_data, test_used, test_total, test_indices = _strided_subsample(
+        test_dataset, TEST_SUBSAMPLE_RATIO, "test", return_indices=True
+    )
+
+    num_workers = min(DATALOADER_WORKERS, max(0, (os.cpu_count() or 2) // 2))
+    loader_kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": torch.cuda.is_available() and PIN_MEMORY,
+        "persistent_workers": num_workers > 0,
+    }
+    bs = params["batch_size"]
+    train_loader = DataLoader(train_data, batch_size=bs, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_data, batch_size=bs, shuffle=False, **loader_kwargs)
+    test_loader = DataLoader(test_data, batch_size=bs, shuffle=False, **loader_kwargs)
+
+    print(f"\n{'='*68}")
+    print(
+        f"seed={seed} variant={fusion_type} groups={len(encoder_groups)} "
+        f"train_windows={train_used}/{train_total} val_windows={val_used}/{val_total} "
+        f"test_windows={test_used}/{test_total}"
+    )
+    print(f"{'='*68}")
+
+    model = LSTMVAE_Grouped(
+        encoder_groups=encoder_groups,
+        hidden_dim=params["hidden_dim"],
+        latent_dim=params["latent_dim"],
+        sequence_length=seq_len,
+        num_layers=params["num_layers"],
+        device=device,
+        binary_group_flags=binary_group_flags,
+        fusion_type=fusion_type,
+    ).to(device)
+
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"Parameters: {n_params:,}")
+
+    optimizer = Adam(model.parameters(), lr=params["learning_rate"])
+    loss_fn = partial(loss_function_grouped, kl_weight=params.get("kl_weight", 0.1))
+
+    if VERBOSE_TRAINING:
+        train_model_grouped(
+            model, train_loader, val_loader, optimizer, loss_fn, scheduler=None,
+            num_epochs=num_epochs, device=device, use_amp=USE_AMP,
+        )
+    else:
+        with contextlib.redirect_stdout(io.StringIO()):
+            train_model_grouped(
+                model, train_loader, val_loader, optimizer, loss_fn, scheduler=None,
+                num_epochs=num_epochs, device=device, use_amp=USE_AMP,
+            )
+
+    baseline_ecdfs = fit_group_ecdf(model, val_loader, device)
+    test_scores = compute_anomaly_scores_grouped(
+        model, test_loader, device, baseline_ecdfs=baseline_ecdfs
+    )
+    threshold, _ = compute_threshold_from_baseline(
+        model, val_loader, device, params["percentile_threshold"], baseline_ecdfs=baseline_ecdfs
+    )
+
+    adjusted_true_full = true_anomalies[seq_len - 1:]
+    adjusted_true = adjusted_true_full[test_indices]
+    scores_arr = np.asarray(test_scores[:len(adjusted_true)], dtype=np.float64)
+    preds = (scores_arr > threshold).astype(int)
+
+    precision, recall, artifact_path = _save_curve_artifact(
+        output_dir=output_dir,
+        dataset="swat",
+        seed=seed,
+        variant=fusion_type,
+        labels=adjusted_true,
+        scores=scores_arr,
+        preds=preds,
+        threshold=threshold,
+        test_indices=test_indices,
+    )
+
+    f1 = f1_score(adjusted_true, preds, zero_division=0)
+    aucpr = (
+        average_precision_score(adjusted_true, scores_arr)
+        if len(np.unique(adjusted_true)) > 1 else float("nan")
+    )
+
+    normal_mask = adjusted_true == 0
+    anom_mask = adjusted_true == 1
+    sep = (
+        float(scores_arr[anom_mask].mean() - scores_arr[normal_mask].mean())
+        if anom_mask.any() else float("nan")
+    )
+
+    print(f"F1={f1:.4f} AUCPR={aucpr:.4f} score_sep={sep:.4f} threshold={threshold:.4f}")
+    return {
+        "seed": seed,
+        "variant": fusion_type,
+        "f1": f1,
+        "aucpr": aucpr,
+        "score_sep": sep,
+        "threshold": threshold,
+        "n_params": n_params,
+        "train_windows": int(train_used),
+        "train_windows_total": int(train_total),
+        "val_windows": int(val_used),
+        "val_windows_total": int(val_total),
+        "test_windows": int(test_used),
+        "test_windows_total": int(test_total),
+        "curve_points": int(len(recall)),
+        "curve_artifact": artifact_path,
+    }
+
+
+def main():
+    set_seed(42)
+    device = DEVICE
+    params = DEFAULT_PARAMS_SWAT.copy()
+    seq_len = SEQUENCE_LENGTH
+    num_epochs = _resolve_num_epochs()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join(OUTPUT_ROOT, f"grouped_ecdf_swat_{timestamp}")
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"Using device: {device}")
+    print(f"cuda_available={torch.cuda.is_available()} device_count={torch.cuda.device_count()}")
+    print(
+        f"Subsampling: train_ratio={TRAIN_SUBSAMPLE_RATIO:.3f}, "
+        f"val_ratio={VAL_SUBSAMPLE_RATIO:.3f}, fs_ratio={FS_SUBSAMPLE_RATIO:.3f}, "
+        f"test_ratio={TEST_SUBSAMPLE_RATIO:.3f}, "
+        f"epochs={num_epochs}"
+    )
+    print(f"Seeds: {SEEDS}")
+    print(f"Fusion variants: {FUSION_TYPES}")
+
+    (
+        train_dataset, val_dataset, test_dataset, true_anomalies,
+        encoder_groups, binary_group_flags
+    ) = _prepare_swat(device, params, seq_len)
+
+    results = []
+    for seed in SEEDS:
+        for fusion_type in FUSION_TYPES:
+            results.append(
+                run_single(
+                    seed=seed,
+                    fusion_type=fusion_type,
+                    train_dataset=train_dataset,
+                    val_dataset=val_dataset,
+                    test_dataset=test_dataset,
+                    true_anomalies=true_anomalies,
+                    encoder_groups=encoder_groups,
+                    binary_group_flags=binary_group_flags,
+                    params=params,
+                    seq_len=seq_len,
+                    device=device,
+                    num_epochs=num_epochs,
+                    output_dir=output_dir,
+                )
+            )
+
+    print("\n" + "=" * 78)
+    print(f"{'Seed':>4}  {'Variant':>10}  {'F1':>7}  {'AUCPR':>7}  {'ScoreSep':>9}  {'Params':>9}")
+    print("-" * 78)
+    for r in results:
+        print(
+            f"{r['seed']:>4}  {r['variant']:>10}  {r['f1']:7.4f}  {r['aucpr']:7.4f}  "
+            f"{r['score_sep']:9.4f}  {r['n_params']:>9,}"
+        )
+
+    print("\nAggregate (mean +/- std):")
+    aggregate = {}
+    for variant in FUSION_TYPES:
+        subset = [r for r in results if r["variant"] == variant]
+        f1s = np.array([r["f1"] for r in subset], dtype=np.float64)
+        aucprs = np.array([r["aucpr"] for r in subset], dtype=np.float64)
+        seps = np.array([r["score_sep"] for r in subset], dtype=np.float64)
+        aggregate[variant] = {
+            "f1_mean": float(f1s.mean()),
+            "f1_std": float(f1s.std()),
+            "aucpr_mean": float(aucprs.mean()),
+            "aucpr_std": float(aucprs.std()),
+            "score_sep_mean": float(seps.mean()),
+            "score_sep_std": float(seps.std()),
+            "n_runs": len(subset),
+        }
+        print(
+            f"  {variant:>10}  F1={f1s.mean():.4f} +/- {f1s.std():.4f}  "
+            f"AUCPR={aucprs.mean():.4f} +/- {aucprs.std():.4f}  "
+            f"Sep={seps.mean():.4f} +/- {seps.std():.4f}"
+        )
+
+    base = {r["seed"]: r["f1"] for r in results if r["variant"] == "none"}
+    for candidate in [v for v in FUSION_TYPES if v != "none"]:
+        cand = {r["seed"]: r["f1"] for r in results if r["variant"] == candidate}
+        wins = sum(cand[s] > base[s] for s in SEEDS)
+        print(f"  {candidate} wins {wins}/{len(SEEDS)} seeds on F1 vs none")
+
+    if (
+        TRAIN_SUBSAMPLE_RATIO < 1.0
+        or VAL_SUBSAMPLE_RATIO < 1.0
+        or TEST_SUBSAMPLE_RATIO < 1.0
+        or FS_SUBSAMPLE_RATIO < 1.0
+    ):
+        print("Note: Subsampling enabled; absolute metrics may differ from full-data runs.")
+
+    summary_path = os.path.join(output_dir, "grouped_ecdf_swat_results.json")
+    payload = {
+        "dataset": "swat",
+        "score_mode": "ecdf",
+        "num_epochs": num_epochs,
+        "params": {k: v for k, v in params.items() if not callable(v)},
+        "metadata": {
+            "num_features": int(len(encoder_groups) and sum(len(group) for group in encoder_groups)),
+            "num_groups": int(len(encoder_groups)),
+            "binary_groups": int(sum(binary_group_flags)),
+            "train_windows_total": int(len(train_dataset)),
+            "val_windows_total": int(len(val_dataset)),
+            "test_windows_total": int(len(test_dataset)),
+            "train_ratio": TRAIN_SUBSAMPLE_RATIO,
+            "val_ratio": VAL_SUBSAMPLE_RATIO,
+            "fs_ratio": FS_SUBSAMPLE_RATIO,
+            "test_ratio": TEST_SUBSAMPLE_RATIO,
+        },
+        "per_seed": results,
+        "aggregate": aggregate,
+    }
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    print(f"Results saved to {summary_path}")
+    if EXPORT_CURVE_ARTIFACTS:
+        print(f"Curve artifacts saved under {output_dir}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,5 +1,13 @@
 # -*- coding: utf-8 -*-
-"""A/B test: fusion variants on SMD machine-1-1."""
+"""Plain LSTM-VAE baseline on SMD (machine-1-1) for comparison with grouped architecture.
+
+Uses a single encoder group containing all 38 features (no feature selection,
+no grouping). Parameter count is matched to the grouped model (~5.9M) by
+scaling hidden_dim to 454.
+
+Mirrors test_fusion_ab.py protocol: 5 seeds, contiguous 70/30 train/val split,
+NUM_EPOCHS=256, no subsampling.
+"""
 
 import os
 import random
@@ -17,12 +25,16 @@ from config import (
 from data_loader import load_smd_data, preprocess_data, create_grouped_sequences
 from models import LSTMVAE_Grouped
 from training import loss_function_grouped, train_model_grouped
-from feature_selection import perform_feature_selection, split_features_by_groups
+from feature_selection import split_features_by_groups
 from evaluation import fit_group_ecdf, compute_anomaly_scores_grouped, compute_threshold_from_baseline
 
 
 SEEDS = [0, 1, 2, 3, 4]
-FUSION_TYPES = ["none", "mlp", "mlp_mean", "attn_mean"]
+
+# Plain model hyperparams — param-matched to grouped (5,904,834 → 5,890,260)
+PLAIN_HIDDEN_DIM = 454
+PLAIN_LATENT_DIM = 13
+PLAIN_NUM_LAYERS = 2
 
 
 def set_seed(seed):
@@ -33,10 +45,7 @@ def set_seed(seed):
 
 
 def contiguous_train_val_split(seqs_train, val_ratio=0.3):
-    """Split sequence windows into contiguous train/val partitions.
-
-    This avoids leakage from random splitting of overlapping windows.
-    """
+    """Split sequence windows into contiguous train/val partitions."""
     n_total = len(seqs_train)
     n_val = max(1, int(round(n_total * val_ratio)))
     n_train = n_total - n_val
@@ -45,9 +54,9 @@ def contiguous_train_val_split(seqs_train, val_ratio=0.3):
     return seqs_train[:n_train], seqs_train[n_train:]
 
 
-def run_single(seed, fusion_type, train_data, val_data, seqs_test,
+def run_single(seed, train_data, val_data, seqs_test,
                true_anomalies, encoder_groups, params, seq_len, device):
-    """Train and evaluate one model. Returns dict of metrics."""
+    """Train and evaluate one plain model. Returns dict of metrics."""
     set_seed(seed)
 
     num_workers = min(DATALOADER_WORKERS, max(0, (os.cpu_count() or 2) // 2))
@@ -59,20 +68,18 @@ def run_single(seed, fusion_type, train_data, val_data, seqs_test,
     val_loader = DataLoader(val_data, batch_size=bs, shuffle=False, **lk)
     test_loader = DataLoader(seqs_test, batch_size=bs, shuffle=False, **lk)
 
-    # --- model ---
-    tag = fusion_type
     print(f"\n{'='*60}")
-    print(f"  seed={seed}  variant={tag}  groups={len(encoder_groups)}")
+    print(f"  seed={seed}  variant=plain")
     print(f"{'='*60}")
 
     model = LSTMVAE_Grouped(
         encoder_groups=encoder_groups,
-        hidden_dim=params["hidden_dim"],
-        latent_dim=params["latent_dim"],
+        hidden_dim=PLAIN_HIDDEN_DIM,
+        latent_dim=PLAIN_LATENT_DIM,
         sequence_length=seq_len,
-        num_layers=params["num_layers"],
+        num_layers=PLAIN_NUM_LAYERS,
         device=device,
-        fusion_type=fusion_type,
+        fusion_type="none",
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -88,7 +95,7 @@ def run_single(seed, fusion_type, train_data, val_data, seqs_test,
         num_epochs=NUM_EPOCHS, device=device, use_amp=USE_AMP,
     )
 
-    # --- evaluation with validation-calibrated threshold ---
+    # Evaluation with validation-calibrated threshold
     baseline_ecdfs = fit_group_ecdf(model, val_loader, device)
     test_scores = compute_anomaly_scores_grouped(
         model, test_loader, device, baseline_ecdfs=baseline_ecdfs)
@@ -97,20 +104,19 @@ def run_single(seed, fusion_type, train_data, val_data, seqs_test,
         baseline_ecdfs=baseline_ecdfs)
 
     adjusted_true = true_anomalies[seq_len - 1:]
-    scores_arr = np.array(test_scores[: len(adjusted_true)])
+    scores_arr = np.array(test_scores[:len(adjusted_true)])
     preds = (scores_arr > threshold).astype(int)
 
     f1 = f1_score(adjusted_true, preds, zero_division=0)
     aucpr = average_precision_score(adjusted_true, scores_arr) if len(np.unique(adjusted_true)) > 1 else float("nan")
 
-    # Score separation diagnostic
     normal_mask = adjusted_true == 0
     anom_mask = adjusted_true == 1
     sep = float(scores_arr[anom_mask].mean() - scores_arr[normal_mask].mean()) if anom_mask.any() else float("nan")
 
     print(f"  F1={f1:.4f}  AUCPR={aucpr:.4f}  score_sep={sep:.4f}  threshold={threshold:.4f}")
 
-    return dict(seed=seed, variant=tag, f1=f1, aucpr=aucpr, score_sep=sep,
+    return dict(seed=seed, variant="plain", f1=f1, aucpr=aucpr, score_sep=sep,
                 threshold=threshold, n_params=n_params)
 
 
@@ -119,19 +125,19 @@ def main():
     params = DEFAULT_PARAMS_SMD.copy()
     seq_len = SEQUENCE_LENGTH
 
-    # Keep feature grouping deterministic and shared across variants/seeds.
     set_seed(42)
+
+    print(f"Using device: {device}")
+    print(f"Plain model: hidden_dim={PLAIN_HIDDEN_DIM}, latent_dim={PLAIN_LATENT_DIM}, "
+          f"num_layers={PLAIN_NUM_LAYERS}")
 
     metric_train, metric_test, true_anomalies = load_smd_data(MACHINE, SMD_DRIVE)
     metric_train = preprocess_data(metric_train.astype(np.float32))
     metric_test = preprocess_data(metric_test.astype(np.float32))
 
-    encoder_groups, _ = perform_feature_selection(
-        metric_train, metric_train.shape[1], seq_len, device,
-        corr_threshold=params.get("corr_threshold", 0.9),
-        importance_percentile=params.get("importance_percentile", 50),
-        lag_penalty_lambda=params.get("lag_penalty_lambda", 0),
-    )
+    n_features = metric_train.shape[1]
+    encoder_groups = [list(range(n_features))]
+    print(f"Plain model: 1 encoder group with all {n_features} features")
 
     data_groups_train = split_features_by_groups(metric_train, encoder_groups)
     data_groups_test = split_features_by_groups(metric_test, encoder_groups)
@@ -143,23 +149,22 @@ def main():
 
     results = []
     for seed in SEEDS:
-        for fusion_type in FUSION_TYPES:
-            res = run_single(
-                seed=seed,
-                fusion_type=fusion_type,
-                train_data=train_data,
-                val_data=val_data,
-                seqs_test=seqs_test,
-                true_anomalies=true_anomalies,
-                encoder_groups=encoder_groups,
-                params=params,
-                seq_len=seq_len,
-                device=device,
-            )
-            results.append(res)
+        res = run_single(
+            seed=seed,
+            train_data=train_data,
+            val_data=val_data,
+            seqs_test=seqs_test,
+            true_anomalies=true_anomalies,
+            encoder_groups=encoder_groups,
+            params=params,
+            seq_len=seq_len,
+            device=device,
+        )
+        results.append(res)
 
-    # --- summary table ---
+    # Summary table
     print("\n" + "=" * 74)
+    print("PLAIN LSTM-VAE RESULTS (SMD machine-1-1)")
     print(f"{'Seed':>4}  {'Variant':>10}  {'F1':>7}  {'AUCPR':>7}  {'ScoreSep':>9}  {'Params':>9}")
     print("-" * 74)
     for r in results:
@@ -167,21 +172,21 @@ def main():
               f"{r['score_sep']:9.4f}  {r['n_params']:>9,}")
 
     # Aggregate
-    for variant in FUSION_TYPES:
-        subset = [r for r in results if r["variant"] == variant]
-        f1s = [r["f1"] for r in subset]
-        aucprs = [r["aucpr"] for r in subset]
-        seps = [r["score_sep"] for r in subset]
-        print(f"\n  {variant:>10}  F1 mean={np.mean(f1s):.4f} +/- {np.std(f1s):.4f}  "
-              f"AUCPR mean={np.mean(aucprs):.4f} +/- {np.std(aucprs):.4f}  "
-              f"Sep mean={np.mean(seps):.4f} +/- {np.std(seps):.4f}")
+    f1s = np.array([r["f1"] for r in results], dtype=np.float64)
+    aucprs = np.array([r["aucpr"] for r in results], dtype=np.float64)
+    seps = np.array([r["score_sep"] for r in results], dtype=np.float64)
+    print(
+        f"\n  Aggregate: F1={f1s.mean():.4f} +/- {f1s.std():.4f}  "
+        f"AUCPR={aucprs.mean():.4f} +/- {aucprs.std():.4f}  "
+        f"Sep={seps.mean():.4f} +/- {seps.std():.4f}"
+    )
 
-    # Decision
-    base_f1s = [r["f1"] for r in results if r["variant"] == "none"]
-    for candidate in [v for v in FUSION_TYPES if v != "none"]:
-        cand_f1s = [r["f1"] for r in results if r["variant"] == candidate]
-        wins = sum(c > b for c, b in zip(cand_f1s, base_f1s))
-        print(f"\n  {candidate} wins {wins}/{len(SEEDS)} seeds on F1 vs none.")
+    # Reference grouped results
+    print("\n" + "=" * 74)
+    print("GROUPED MODEL REFERENCE (from A/B test, 6 groups, same protocol)")
+    print("-" * 74)
+    print("  none (no fusion):  F1=0.4740+/-0.0089  AUCPR=0.7448+/-0.0073  Sep=9.9247+/-0.1279")
+    print("  attn_mean:         F1=0.4804+/-0.0132  AUCPR=0.7423+/-0.0102  Sep=9.9145+/-0.3057")
 
 
 if __name__ == "__main__":
