@@ -11,6 +11,14 @@
 ### [Overleaf - Semester Plan](https://www.overleaf.com/read/qfqqmwcdkndy#c3c0d2)
 ### [Overleaf - Report](https://www.overleaf.com/read/jpqpnqkrwwdr#5e93f9)
 
+## Grouped Autoencoder — Grouped LSTM-VAE
+
+Grouped LSTM variational autoencoder for multivariate time-series anomaly detection with unsupervised feature grouping, optional latent fusion, and validation-calibrated ECDF scoring. Evaluated on SMAP/MSL, SMD, and SWaT.
+
+📂 **[grouped_autoencoder/](grouped_autoencoder/)** — see the [subproject README](grouped_autoencoder/README.md) for architecture details, the feature selection pipeline, running instructions, and a key files reference.
+
+---
+
 ## Temporal and Spatial Anomaly Detection
 
 ### Definition

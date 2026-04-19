@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Configuration settings for LSTM VAE stacked anomaly detection."""
+"""Configuration settings for grouped LSTM VAE anomaly detection."""
 
 import os
 import torch

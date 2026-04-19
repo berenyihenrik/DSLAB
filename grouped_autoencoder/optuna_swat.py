@@ -586,7 +586,7 @@ def parse_args():
     parser.add_argument(
         "--output-dir",
         type=str,
-        default=os.getenv("SWAT_OPTUNA_OUTPUT_DIR", "stacked_autoencoder/optuna_results"),
+        default=os.getenv("SWAT_OPTUNA_OUTPUT_DIR", "grouped_autoencoder/optuna_results"),
     )
     parser.add_argument("--seed", type=int, default=int(os.getenv("SWAT_OPTUNA_SEED", "42")))
     parser.add_argument(
