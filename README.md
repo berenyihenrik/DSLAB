@@ -11,6 +11,10 @@
 ### [Overleaf - Semester Plan](https://www.overleaf.com/read/qfqqmwcdkndy#c3c0d2)
 ### [Overleaf - Report](https://www.overleaf.com/read/jpqpnqkrwwdr#5e93f9)
 
+## MSc Thesis
+
+### [Overleaf - Thesis](https://www.overleaf.com/read/mwbdvnxdmvbz#b42865)
+
 ## Grouped Autoencoder — Grouped LSTM-VAE
 
 Grouped LSTM variational autoencoder for multivariate time-series anomaly detection with unsupervised feature grouping, optional latent fusion, and validation-calibrated ECDF scoring. Evaluated on SMAP/MSL, SMD, and SWaT.
