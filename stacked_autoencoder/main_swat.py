@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from config import (
     SWAT_NORMAL_DATASET, SWAT_ATTACK_DATASET, SWAT_VAL_RATIO,
@@ -27,6 +27,11 @@ from evaluation import (
 )
 from visualization import print_final_summary
 from feature_selection import perform_feature_selection, split_features_by_groups
+
+
+TRAIN_SUBSAMPLE_RATIO = float(os.getenv("SWAT_TRAIN_SUBSAMPLE_RATIO", "1.0"))
+VAL_SUBSAMPLE_RATIO = float(os.getenv("SWAT_VAL_SUBSAMPLE_RATIO", "1.0"))
+FS_SUBSAMPLE_RATIO = float(os.getenv("SWAT_FS_SUBSAMPLE_RATIO", "1.0"))
 
 
 def set_seed(seed=42):
@@ -50,6 +55,44 @@ def _normalize_binary_with_train_stats(train_data, other_arrays, binary_indices)
     return train_data, other_arrays
 
 
+def _validate_ratio(name, ratio):
+    """Validate that a subsampling ratio is in the open interval (0, 1]."""
+    if not (0.0 < ratio <= 1.0):
+        raise ValueError(f"{name} must be in (0, 1], got {ratio}")
+
+
+def _strided_subsample(dataset, ratio, tag):
+    """Reduce overlap-heavy windows by taking an approximately uniform stride."""
+    _validate_ratio(f"{tag} subsample ratio", ratio)
+    n_total = len(dataset)
+    if ratio >= 1.0:
+        return dataset, n_total, n_total
+
+    n_target = max(1, int(round(n_total * ratio)))
+    stride = max(1, n_total // n_target)
+    indices = np.arange(0, n_total, stride, dtype=np.int64)[:n_target]
+    subset = Subset(dataset, indices.tolist())
+    return subset, len(indices), n_total
+
+
+def _subsample_timesteps_for_fs(data, ratio, seq_len):
+    """Subsample timesteps before feature selection to speed up Stage-2 AE."""
+    _validate_ratio("feature-selection subsample ratio", ratio)
+    n_total = data.shape[0]
+    if ratio >= 1.0:
+        return data, n_total, n_total
+
+    min_rows = seq_len + 1
+    n_target = max(min_rows, int(round(n_total * ratio)))
+    stride = max(1, n_total // n_target)
+    sampled = data[::stride]
+    if sampled.shape[0] > n_target:
+        sampled = sampled[:n_target]
+    if sampled.shape[0] < min_rows:
+        sampled = data[:min_rows]
+    return sampled, sampled.shape[0], n_total
+
+
 def main(seed=42, num_epochs_override=None):
     """Main execution function for SWaT dataset."""
     set_seed(seed)
@@ -58,6 +101,15 @@ def main(seed=42, num_epochs_override=None):
 
     device = DEVICE
     print(f"Using device: {device}")
+    _validate_ratio("train ratio", TRAIN_SUBSAMPLE_RATIO)
+    _validate_ratio("val ratio", VAL_SUBSAMPLE_RATIO)
+    _validate_ratio("feature-selection ratio", FS_SUBSAMPLE_RATIO)
+    print(
+        "SWaT resampling settings: "
+        f"train_ratio={TRAIN_SUBSAMPLE_RATIO:.3f}, "
+        f"val_ratio={VAL_SUBSAMPLE_RATIO:.3f}, "
+        f"fs_ratio={FS_SUBSAMPLE_RATIO:.3f}"
+    )
 
     # 1) Load SWaT data
     metric_tensor, metric_test_tensor, true_anomalies = load_swat_data(
@@ -97,12 +149,18 @@ def main(seed=42, num_epochs_override=None):
     dropped_feature_indices = []
     if continuous_indices:
         continuous_train = train_series[:, continuous_indices]
+        fs_train, fs_rows_used, fs_rows_total = _subsample_timesteps_for_fs(
+            continuous_train,
+            FS_SUBSAMPLE_RATIO,
+            SEQUENCE_LENGTH,
+        )
+        print(f"Feature-selection rows: {fs_rows_used}/{fs_rows_total}")
         # SWaT is large enough that Stage-2 importance can OOM on GPU.
         # Run feature selection on CPU while keeping final model training on DEVICE.
         fs_device = DEVICE
         cont_groups_local, dropped_local = perform_feature_selection(
-            continuous_train,
-            continuous_train.shape[1],
+            fs_train,
+            fs_train.shape[1],
             SEQUENCE_LENGTH,
             fs_device,
             corr_threshold=best_params.get('corr_threshold', 0.9),
@@ -140,6 +198,21 @@ def main(seed=42, num_epochs_override=None):
     val_dataset = GroupedSequenceDataset(data_groups_val, SEQUENCE_LENGTH)
     test_dataset = GroupedSequenceDataset(data_groups_test, SEQUENCE_LENGTH)
 
+    train_data, train_used, train_total = _strided_subsample(
+        train_dataset,
+        TRAIN_SUBSAMPLE_RATIO,
+        "train",
+    )
+    val_data, val_used, val_total = _strided_subsample(
+        val_dataset,
+        VAL_SUBSAMPLE_RATIO,
+        "val",
+    )
+    print(
+        f"Window subsampling: train={train_used}/{train_total}, "
+        f"val={val_used}/{val_total}, test={len(test_dataset)}/{len(test_dataset)}"
+    )
+
     num_workers = min(DATALOADER_WORKERS, max(0, (os.cpu_count() or 2) // 2))
     loader_kwargs = {
         "num_workers": num_workers,
@@ -158,8 +231,8 @@ def main(seed=42, num_epochs_override=None):
     final_batch_size = best_params['batch_size']
     final_percentile_threshold = best_params['percentile_threshold']
 
-    train_loader_final = DataLoader(train_dataset, batch_size=final_batch_size, shuffle=True, **loader_kwargs)
-    val_loader_final = DataLoader(val_dataset, batch_size=final_batch_size, shuffle=False, **loader_kwargs)
+    train_loader_final = DataLoader(train_data, batch_size=final_batch_size, shuffle=True, **loader_kwargs)
+    val_loader_final = DataLoader(val_data, batch_size=final_batch_size, shuffle=False, **loader_kwargs)
     test_loader_final = DataLoader(test_dataset, batch_size=final_batch_size, shuffle=False, **loader_kwargs)
 
     # 7) Train grouped LSTM-VAE

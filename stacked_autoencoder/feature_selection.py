@@ -416,7 +416,9 @@ def _compute_masking_importance(
 
 def perform_feature_selection(train_data, n_features, sequence_length, device,
                               corr_threshold=0.9, importance_percentile=50,
-                              lag_penalty_lambda=None):
+                              lag_penalty_lambda=None, fs_ae_hidden_dim=64,
+                              fs_ae_num_epochs=15, fs_ae_batch_size=64,
+                              fs_ae_n_repeats=3):
     """Four-stage unsupervised feature selection on training data only.
 
     Stage 0: Drop static features (std == 0).
@@ -437,6 +439,10 @@ def perform_feature_selection(train_data, n_features, sequence_length, device,
             encoder group.  Lower clusters are merged into a catch-all group.
         lag_penalty_lambda: optional decay constant for the lag penalty
             w(tau) = exp(-|tau| / lambda).  None disables it (all lags equal).
+        fs_ae_hidden_dim: hidden size for Stage-2 lightweight LSTM-AE.
+        fs_ae_num_epochs: training epochs for Stage-2 lightweight LSTM-AE.
+        fs_ae_batch_size: batch size for Stage-2 lightweight LSTM-AE.
+        fs_ae_n_repeats: block-permutation repeats for Stage-2 masking importance.
 
     Returns:
         encoder_groups: list[list[int]] — each inner list is original feature indices
@@ -464,7 +470,14 @@ def perform_feature_selection(train_data, n_features, sequence_length, device,
 
         # Stage 2: AE masking importance on representatives
         importance_scores = _compute_masking_importance(
-            kept_data, representative_local, sequence_length, device
+            kept_data,
+            representative_local,
+            sequence_length,
+            device,
+            hidden_dim=fs_ae_hidden_dim,
+            num_epochs=fs_ae_num_epochs,
+            batch_size=fs_ae_batch_size,
+            n_repeats=fs_ae_n_repeats,
         )
 
         # Build mapping: representative local index → importance score
@@ -559,6 +572,92 @@ def perform_feature_selection(train_data, n_features, sequence_length, device,
     print(f"\n  Dropped static continuous features ({len(dropped_feature_indices)}): {dropped_feature_indices}")
 
     return encoder_groups, dropped_feature_indices
+
+
+def compute_feature_selection_similarity_diagnostics(
+    train_data,
+    sequence_length,
+    corr_threshold=0.9,
+    lag_penalty_lambda=None,
+):
+    """Expose Stage-0/Stage-1 feature-selection artifacts for visualization.
+
+    This helper mirrors the front half of ``perform_feature_selection`` while
+    stopping before the Stage-2 masking AE. It is intended for diagnostics and
+    figure generation, where we want the lagged Spearman similarity matrix and
+    cluster assignments without paying the cost of importance scoring.
+
+    Args:
+        train_data: Training array of shape (timesteps, n_features).
+        sequence_length: Window length used for the lagged correlation search.
+        corr_threshold: |correlation| above which features are clustered.
+        lag_penalty_lambda: Optional decay constant for lag penalty.
+
+    Returns:
+        dict containing Stage-0/Stage-1 diagnostics:
+            kept_feature_indices: dynamic feature indices retained for clustering
+            dropped_feature_indices: static continuous features removed in Stage 0
+            static_binary_indices: static binary features retained separately
+            similarity_matrix: lagged Spearman similarity over kept features
+            representative_local_indices: medoid representatives in kept-feature space
+            representative_original_indices: medoid representatives in original space
+            cluster_labels: cluster id per kept feature (local order)
+            cluster_members_local: cluster membership in kept-feature space
+            cluster_members_original: cluster membership in original feature space
+            cluster_representatives_local: representative per cluster in local space
+            cluster_representatives_original: representative per cluster in original space
+    """
+    kept_indices, dropped_indices, static_binary_indices = _drop_static_features(train_data)
+
+    diagnostics = {
+        "kept_feature_indices": kept_indices,
+        "dropped_feature_indices": dropped_indices,
+        "static_binary_indices": static_binary_indices,
+        "similarity_matrix": np.zeros((0, 0), dtype=float),
+        "representative_local_indices": np.array([], dtype=int),
+        "representative_original_indices": np.array([], dtype=int),
+        "cluster_labels": np.array([], dtype=int),
+        "cluster_members_local": {},
+        "cluster_members_original": {},
+        "cluster_representatives_local": {},
+        "cluster_representatives_original": {},
+    }
+
+    if len(kept_indices) == 0:
+        return diagnostics
+
+    kept_data = train_data[:, kept_indices]
+    representative_local, cluster_labels, cluster_members_dict, cluster_rep_dict = \
+        _compute_redundancy_clusters(
+            kept_data,
+            corr_threshold,
+            max_lag=sequence_length,
+            lag_penalty_lambda=lag_penalty_lambda,
+        )
+
+    cache_key = (kept_data.shape, sequence_length, lag_penalty_lambda)
+    similarity = _similarity_cache[cache_key]
+
+    diagnostics.update({
+        "similarity_matrix": similarity.copy(),
+        "representative_local_indices": representative_local.copy(),
+        "representative_original_indices": kept_indices[representative_local].copy(),
+        "cluster_labels": cluster_labels.copy(),
+        "cluster_members_local": {
+            cid: members.copy() for cid, members in cluster_members_dict.items()
+        },
+        "cluster_members_original": {
+            cid: [int(kept_indices[m]) for m in members]
+            for cid, members in cluster_members_dict.items()
+        },
+        "cluster_representatives_local": {
+            cid: int(rep) for cid, rep in cluster_rep_dict.items()
+        },
+        "cluster_representatives_original": {
+            cid: int(kept_indices[rep]) for cid, rep in cluster_rep_dict.items()
+        },
+    })
+    return diagnostics
 
 
 def split_features_by_groups(data, encoder_groups):
