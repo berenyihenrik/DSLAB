@@ -102,19 +102,19 @@ DEFAULT_PARAMS = { # For SMAP
     'scheduler_factor': 0.1
 }
 
-DEFAULT_PARAMS_SWAT = {  # For SWaT
-    'hidden_dim': 96,
-    'latent_dim': 16,
-    'num_layers': 2,
-    'learning_rate': 0.001,
-    'batch_size': 1024,
-    'percentile_threshold': 95,
-    'kl_weight': 0.01,
+DEFAULT_PARAMS_SWAT = {  # For SWaT – Phase 2 winner (Trial 19)
+    'hidden_dim': 128,
+    'latent_dim': 24,
+    'num_layers': 1,
+    'learning_rate': 0.004832259207239238,
+    'batch_size': 512,
+    'percentile_threshold': 99,
+    'kl_weight': 0.0035012211243208853,
     'use_scheduler': False,
     'scheduler_patience': 5,
     'scheduler_factor': 0.1,
-    'corr_threshold': 0.9,
-    'importance_percentile': 50,
+    'corr_threshold': 0.9428522711444408,
+    'importance_percentile': 60,
 }
 
 # Device configuration
